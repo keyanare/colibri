@@ -154,12 +154,28 @@ static void tok_load(Tok *T, const char *path){
     hm_init(&T->merges, mc);
     if(merges) for(int i=0;i<merges->len;i++){
         jval *pr=merges->kids[i];
-        if(!pr||pr->t!=J_ARR||pr->len<2||!pr->kids[0]||!pr->kids[1]||
-           pr->kids[0]->t!=J_STR||pr->kids[1]->t!=J_STR){
-            fprintf(stderr,"tokenizer.json: malformed merge entry %d\n",i); exit(1); }
-        const char *l=pr->kids[0]->str, *r=pr->kids[1]->str;
-        int ll=(int)strlen(l), rl=(int)strlen(r);
-        char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
+        const char *l=NULL, *r=NULL; int ll=0, rl=0;
+        if(pr && pr->t==J_ARR && pr->len>=2 && pr->kids[0] && pr->kids[1] &&
+           pr->kids[0]->t==J_STR && pr->kids[1]->t==J_STR){
+            /* ["left","right"] — the form GLM-5.2 / Inkling / Kimi K3 ship. */
+            l=pr->kids[0]->str; r=pr->kids[1]->str;
+            ll=(int)strlen(l); rl=(int)strlen(r);
+        } else if(pr && pr->t==J_STR){
+            /* "left right" — the CLASSIC HF form, still emitted by current
+             * `tokenizers` and what DeepSeek-V4-Flash ships. Unambiguous for a
+             * byte-level BPE: a real space is encoded as U+0120 (Ġ), so the one
+             * literal 0x20 in the entry is always the separator. Refusing this
+             * form is refusing half the tokenizers in the wild. */
+            const char *sp=strchr(pr->str,' ');
+            if(!sp){ fprintf(stderr,"tokenizer.json: merge entry %d has no separator: %s\n",
+                             i,pr->str); exit(1); }
+            l=pr->str; ll=(int)(sp-pr->str);
+            r=sp+1;    rl=(int)strlen(r);
+        } else {
+            fprintf(stderr,"tokenizer.json: malformed merge entry %d\n",i); exit(1);
+        }
+        if(ll<=0||rl<=0){ fprintf(stderr,"tokenizer.json: empty side in merge entry %d\n",i); exit(1); }
+        char *key=malloc((size_t)ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
         hm_put(&T->merges, key, ll+1+rl, i);
     }
     /* added tokens (speciali e non): atomici, output letterale */
