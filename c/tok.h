@@ -20,6 +20,7 @@
 #include "json.h"
 #include "tok_unicode.h"
 #include "tok_unicode_o200k.h"
+#include "tok_unicode_dsv4.h"
 
 /* ---------- hash map (chiavi binarie con lunghezza) ---------- */
 typedef struct { const char *k; int klen; int v; int used; } ment;
@@ -52,6 +53,10 @@ typedef struct {
     uint32_t byte2cp[256]; int byte2cp_len[256]; char byte2str[256][3];
     int16_t cp2byte[1024];
     int o200k;           /* pre_tokenizer regex family: 0 = cl100k (GLM), 1 = o200k (Inkling) */
+    int dsv4;            /* 1 = DeepSeek-V4 family: a SEQUENCE of three Isolated
+                          * Splits (digits, CJK runs, then the main alternation).
+                          * Distinguished from every other family by having NO
+                          * contraction group at all -- see pretok_chunk_dsv4. */
     int kimi;            /* 1 = Kimi (K3) family: o200k rules + a leading \p{Han}-run rule,
                           * Han excluded from the letter classes, no '/' tail in the punct rule */
     int rankbpe;         /* 1 = no merges list (tiktoken-derived vocab): merge the adjacent
@@ -204,6 +209,14 @@ static void tok_load(Tok *T, const char *path){
             jval *rx=pat?json_get(pat,"Regex"):NULL;
             if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Lu}")) T->o200k=1;
             if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Han}")) T->kimi=1;
+            /* DeepSeek-V4: its CJK rule spells the ranges out literally rather
+             * than using \p{Han}, and its main rule is the only one in any
+             * family here built on \p{P}/\p{S}. Either fragment identifies it,
+             * and neither appears in cl100k/o200k/kimi. Without this the
+             * pattern would fall through to cl100k -- same bytes in, different
+             * tokens out, no error. */
+            if(rx&&rx->t==J_STR&&(strstr(rx->str,"\\p{P}\\p{S}")||
+                                  strstr(rx->str,"\u4e00-\u9fa5"))) T->dsv4=1;
         }
     }
     /* arena/buf restano allocati: le stringhe (j_dup) sono malloc indipendenti e ci servono vive */
@@ -514,6 +527,140 @@ static void pretok_chunk_kimi(Tok *T, const unsigned char *p, int a, int b, int 
 }
 
 /* ---------- encode: testo -> id (split sugli added token, poi pretok+BPE) ---------- */
+/* ---------- pre-tokenizer DeepSeek-V4-Flash ----------
+ * Unlike every other family here, this pre_tokenizer is a SEQUENCE of three
+ * Isolated Splits applied in order, not one regex:
+ *
+ *   1) \p{N}{1,3}
+ *   2) [一-龥぀-ゟ゠-ヿ]+     (Han + hiragana + katakana)
+ *   3) [!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+
+ *      |[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
+ *      | ?[\p{P}\p{S}]+[\r\n]*
+ *      |\s*[\r\n]+|\s+(?!\S)|\s+
+ *
+ * Two things make it genuinely distinct rather than a cl100k variant, and both
+ * change tokenization on ordinary text:
+ *   - THERE IS NO CONTRACTION RULE. "don't" splits as "don" + "'t", where the
+ *     "'t" comes from the punctuation-then-ASCII-letters branch, not from
+ *     (?i:'s|'t|...). Every other family in this file has that group; this one
+ *     does not, which is what tools/dsv4_tokenizer.py keys on.
+ *   - THE PUNCT-THEN-LETTERS BRANCH IS FIRST, so ",b" and ".c" in "a,b.c" are
+ *     single pre-tokens. cl100k would produce "a" "," "b" "." "c".
+ *
+ * Passes 1 and 2 emit their matches directly instead of feeding them through
+ * pass 3. That is not a shortcut: a digit group matches NO branch of pass 3, so
+ * it would hit the one-codepoint fallback and "123" would come out as three
+ * pieces. CJK runs would match branch B and survive intact either way; they are
+ * emitted here for symmetry.
+ *
+ * Nothing about DeepSeek's Sequence is expressible in the single-regex shape
+ * the other three families share, so this deliberately does not try to reuse
+ * o2_letters and friends. */
+static int dsv4_is_cjk(uint32_t c){
+    return (c>=0x4E00&&c<=0x9FA5) || (c>=0x3040&&c<=0x309F) || (c>=0x30A0&&c<=0x30FF);
+}
+static int dsv4_is_ascii_punct(uint32_t c){
+    return c<128 && c!=0 && strchr("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~",(int)c)!=NULL;
+}
+static int dsv4_is_ascii_alpha(uint32_t c){
+    return (c>='A'&&c<='Z')||(c>='a'&&c<='z');
+}
+
+/* pass 3: the alternation, on a span already free of digit groups and CJK runs */
+static void dsv4_pass3(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
+    int nb=b-a; if(nb<=0) return;
+    uint32_t *cp=malloc((size_t)(nb+1)*sizeof(uint32_t)); int *off=malloc((size_t)(nb+2)*sizeof(int));
+    if(!cp||!off){ free(cp); free(off); return; }
+    int n=0;
+    for(int i=a;i<b;){ uint32_t c; int k=u8_next(p,b,i,&c); off[n]=i; cp[n]=c; n++; i+=k; }
+    off[n]=b;
+    #define ISNL(c) ((c)=='\r'||(c)=='\n')
+    #define ISPS(c) (is_P(c)||is_Sym(c))
+    int i=0;
+    while(i<n){
+        int start=i; uint32_t c=cp[i];
+        /* A: ASCII punct followed by one or more ASCII letters -- FIRST, so it
+         * wins over the punctuation run in branch C. */
+        if(dsv4_is_ascii_punct(c) && i+1<n && dsv4_is_ascii_alpha(cp[i+1])){
+            int j=i+1; while(j<n && dsv4_is_ascii_alpha(cp[j])) j++;
+            i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
+        }
+        /* B: [^\r\n\p{L}\p{P}\p{S}]? [\p{L}\p{M}]+   -- the optional prefix is
+         * what attaches a leading space to a word (" stop"). */
+        {
+            int j=i;
+            if(!ISNL(c) && !is_L(c) && !ISPS(c)) j++;      /* optional single prefix char */
+            if(j<n && (is_L(cp[j])||is_M(cp[j]))){
+                while(j<n && (is_L(cp[j])||is_M(cp[j]))) j++;
+                i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
+            }
+        }
+        /* C: ' ?[\p{P}\p{S}]+[\r\n]*' */
+        {
+            int j=i;
+            if(c==' ' && j+1<n && ISPS(cp[j+1])) j++;
+            if(j<n && ISPS(cp[j])){
+                while(j<n && ISPS(cp[j])) j++;
+                while(j<n && ISNL(cp[j])) j++;
+                i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
+            }
+        }
+        /* D: \s*[\r\n]+   E: \s+(?!\S)   F: \s+
+         * E's lookahead is the reason for the r-1: a whitespace run followed by
+         * a non-space gives back its last character, which is what makes
+         * "  spaces" tokenize as " " + " spaces". */
+        {
+            int r=i; while(r<n && is_S(cp[r])) r++;
+            if(r>i){
+                int last=-1; for(int j=i;j<r;j++) if(ISNL(cp[j])) last=j;
+                if(last>=0){ i=last+1; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+                int end = (r<n) ? r-1 : r;
+                if(end<=i) end=i+1;
+                i=end; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
+            }
+        }
+        i++;
+        bpe_piece(T,p,off[start],off[i],out,no,max);
+    }
+    #undef ISPS
+    #undef ISNL
+    free(cp); free(off);
+}
+
+/* pass 2: isolate CJK runs, pass everything else to pass 3 */
+static void dsv4_pass2(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
+    int i=a, seg=a;
+    while(i<b){
+        uint32_t c; int k=u8_next(p,b,i,&c);
+        if(dsv4_is_cjk(c)){
+            if(i>seg) dsv4_pass3(T,p,seg,i,out,no,max);
+            int j=i;
+            while(j<b){ uint32_t d; int k2=u8_next(p,b,j,&d); if(!dsv4_is_cjk(d)) break; j+=k2; }
+            bpe_piece(T,p,i,j,out,no,max);
+            i=j; seg=j; continue;
+        }
+        i+=k;
+    }
+    if(b>seg) dsv4_pass3(T,p,seg,b,out,no,max);
+}
+
+/* pass 1: isolate \p{N}{1,3} groups, pass everything else to pass 2 */
+static void pretok_chunk_dsv4(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
+    int i=a, seg=a;
+    while(i<b){
+        uint32_t c; int k=u8_next(p,b,i,&c);
+        if(is_N(c)){
+            if(i>seg) dsv4_pass2(T,p,seg,i,out,no,max);
+            int j=i, cnt=0;
+            while(j<b && cnt<3){ uint32_t d; int k2=u8_next(p,b,j,&d); if(!is_N(d)) break; j+=k2; cnt++; }
+            bpe_piece(T,p,i,j,out,no,max);
+            i=j; seg=j; continue;
+        }
+        i+=k;
+    }
+    if(b>seg) dsv4_pass2(T,p,seg,b,out,no,max);
+}
+
 static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
     const unsigned char *p=(const unsigned char*)text; int no=0; int i=0;
     while(i<len){
@@ -527,7 +674,8 @@ static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
         }
         int chunk_end = (hitpos<0) ? len : hitpos;
         if(chunk_end>i){
-            if(T->kimi)       pretok_chunk_kimi(T,p,i,chunk_end,out,&no,max);
+            if(T->dsv4)       pretok_chunk_dsv4(T,p,i,chunk_end,out,&no,max);
+            else if(T->kimi)  pretok_chunk_kimi(T,p,i,chunk_end,out,&no,max);
             else if(T->o200k) pretok_chunk_o200k(T,p,i,chunk_end,out,&no,max);
             else              pretok_chunk(T,p,i,chunk_end,out,&no,max);
         }

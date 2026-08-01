@@ -228,7 +228,11 @@ CUDA_OBJ  =
 # they fail to link. Having a rule is the honest definition of "this is a gate".
 TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(firstword $(MAKEFILE_LIST)))
 # test_uring has a rule but is Linux-only; it is appended conditionally just below.
-TEST_EXCLUDE = test_uring
+# test_tok_dsv4 has a rule but is a HARNESS, not a gate: it takes a tokenizer.json
+# and a case file as arguments (the DeepSeek-V4 checkpoint ships no vocabulary, so
+# there is nothing to hardcode). It is driven by tools/dsv4_tokenizer.py --ctest
+# and by tests/test_dsv4_tokenizer.py; run bare it would exit 2 and fail test-c.
+TEST_EXCLUDE = test_uring test_tok_dsv4
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -501,6 +505,9 @@ tests/test_st$(EXE): tests/test_st.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_st_mirror$(EXE): tests/test_st_mirror.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_tok_dsv4$(EXE): tests/test_tok_dsv4.c tok.h tok_unicode.h tok_unicode_o200k.h tok_unicode_dsv4.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_tier$(EXE): tests/test_tier.c tier.h
