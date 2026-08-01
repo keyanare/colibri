@@ -507,10 +507,13 @@ tests/test_st$(EXE): tests/test_st.c st.h json.h compat.h
 tests/test_st_mirror$(EXE): tests/test_st_mirror.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_tok_dsv4$(EXE): tests/test_tok_dsv4.c tok.h tok_unicode.h tok_unicode_o200k.h tok_unicode_dsv4.h json.h
+tests/test_tier$(EXE): tests/test_tier.c tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_tier$(EXE): tests/test_tier.c tier.h
+deepseek_v4$(EXE): deepseek_v4.c dsv4.h dsv4_model.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_tok_dsv4$(EXE): tests/test_tok_dsv4.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_dsv4$(EXE): tests/test_dsv4.c dsv4.h

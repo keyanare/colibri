@@ -84,6 +84,11 @@ static int st_dtype_code(const char *s) {
      * quant.h's ue8m0_decode -- so it belongs to the same raw-byte class as
      * U8/I8 and is read by byte count, never by st_read_f32's element loop. */
     if (!strcmp(s, "F8_E8M0")) return 3;
+    /* I32: integer side tables (DeepSeek-V4's hash-routing tid2eid). Raw-byte
+     * class like U8 -- st_read_f32's element loop must never touch it, and the
+     * dtype-3 branch skips the numel*esz check that would reject 4-byte
+     * elements. Read with st_read_raw and cast by the caller. */
+    if (!strcmp(s, "I32")) return 3;
     fprintf(stderr, "unsupported dtype: %s\n", s); exit(1);
 }
 
