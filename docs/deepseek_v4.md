@@ -129,8 +129,14 @@ python3 c/tools/dsv4_tokenizer.py /nvme/dsv4 --ctest c/tests/test_tok_dsv4
 ### 3. Run
 
 ```bash
+./c/deepseek_v4 /nvme/dsv4 --preflight                    # do this first
 ./c/deepseek_v4 /nvme/dsv4 "your prompt" --expert-gb 8 --max-seq 8192 --ngen 64
 ```
+
+`--preflight` walks the tensor manifest against the checkpoint using only the
+safetensors headers — seconds on 160 GB, no weight byte read. It names every
+missing tensor, wrong byte count and absent `.scale` sidecar, and reports
+tensors it does not cover (the MTP head) as expected rather than as corruption.
 
 | flag | meaning |
 |---|---|
@@ -140,6 +146,7 @@ python3 c/tools/dsv4_tokenizer.py /nvme/dsv4 --ctest c/tests/test_tok_dsv4
 | `--temp T` | 0 = greedy (default) |
 | `--ids` | treat the prompt as comma-separated token ids; skips the tokenizer |
 | `--dump-logits F` | write per-step logits — the oracle path |
+| `--preflight` | check names and shapes against the manifest, read no weights |
 
 `dsv4_doctor.py` suggests an `--expert-gb` that fits your RAM.
 
@@ -215,16 +222,13 @@ Three real defects were caught this way, which is the argument for the harness:
 
 ## Next, in order of value
 
-1. **A preflight command** — walk the manifest against a real checkpoint before
-   reading any weights. Turns "downloaded 160 GB, crashed on tensor 10" into one
-   message.
-2. **NEON `matmul_mxfp4`** — the expert kernel is scalar on Apple Silicon and it
+1. **NEON `matmul_mxfp4`** — the expert kernel is scalar on Apple Silicon and it
    is the hot loop. `quant.h` already has NEON idioms next to it.
-3. **Batched expert I/O** — one `pread` per expert instead of six, `O_DIRECT`,
+2. **Batched expert I/O** — one `pread` per expert instead of six, `O_DIRECT`,
    and overlap with compute. `colibri.c` and `kimi_k3.c` already do all three.
-4. **Exact prefetch on the hash layers** — the one place in this repository where
+3. **Exact prefetch on the hash layers** — the one place in this repository where
    the working set is knowable in advance.
-5. **A token-exact oracle** on the real checkpoint. Everything above is
+4. **A token-exact oracle** on the real checkpoint. Everything above is
    provisional until this exists.
 
 ---

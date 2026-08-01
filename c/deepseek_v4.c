@@ -96,6 +96,7 @@ static int   g_max_seq     = 8192;    /* cache sizing; config's 1M would need
                                        * ~GBs of KV per layer and is not a
                                        * useful default for a first run */
 static int   g_verbose     = 1;
+static int   g_preflight   = 0;      /* --preflight: check the checkpoint, load nothing */
 static int   g_ids_mode    = 0;      /* --ids: token ids given directly, no tokenizer */
 static const char *g_dump  = NULL;   /* --dump-logits: oracle output for the fixture */
 
@@ -871,23 +872,170 @@ static int sample(Model *m){
 
 /* -------------------------------------------------------------------- main */
 
+
+/* ---------------------------------------------------------------- preflight
+ * Walk the manifest against a real checkpoint WITHOUT reading a single weight
+ * byte: st_init parses only the safetensors headers, so this is seconds on a
+ * 160 GB container. It answers the question that otherwise costs a download
+ * plus a crash -- does this checkpoint contain what the engine expects, with
+ * the shapes it expects?
+ *
+ * It deliberately uses dsv4_manifest, the same derivation the loader consumes.
+ * A separate re-implementation of the expected tensor set would drift from the
+ * loader precisely when it mattered.
+ *
+ * UNMATCHED CONTAINER TENSORS ARE NOT ERRORS. The manifest covers the main
+ * stack only: the MTP head is real (num_nextn_predict_layers=1, and
+ * compress_ratios carries a 44th entry for it) but its names are unknown, so
+ * anything left over is reported as expected-unknown. Treating it as corruption
+ * would make a correct checkpoint look broken. */
+static int64_t pf_expect_weight(const DSV4Tensor *t){
+    int64_t O=t->d0, I=t->d1?t->d1:1;
+    switch(t->role){
+        case DSV4_T_FP8: return O*I;                 /* raw e4m3 */
+        case DSV4_T_FP4: return O*((I+1)/2);         /* packed nibbles */
+        case DSV4_T_I32: return O*I*4;
+        default:         return -1;                  /* PLAIN: bf16 or f32 */
+    }
+}
+
+static int preflight(const char *dir){
+    double t0=now_s();
+    fprintf(stderr,"  preflight: %s\n",dir);
+
+    char cp[2100]; snprintf(cp,sizeof cp,"%s/config.json",dir);
+    FILE *f=fopen(cp,"rb");
+    if(!f){ fprintf(stderr,"  FAIL  cannot open %s\n",cp); return 1; }
+    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+    if(n<=0||n>(64L<<20)){ fprintf(stderr,"  FAIL  %s: implausible size %ld\n",cp,n); fclose(f); return 1; }
+    char *buf=(char*)xalloc((size_t)n+1,"config");
+    size_t got=fread(buf,1,(size_t)n,f); buf[got]=0; fclose(f);
+    char *arena=NULL; jval *root=json_parse(buf,&arena);
+    DSV4Cfg c;
+    if(!root || dsv4_cfg_from_json(root,&c)!=0){ fprintf(stderr,"  FAIL  config.json rejected\n"); return 1; }
+    fprintf(stderr,"  config: %d layers, dim %d, %d experts/layer, top-%d, vocab %d\n",
+            c.n_layers,c.dim,c.n_routed_experts,c.n_activated_experts,c.vocab_size);
+
+    static shards S; memset(&S,0,sizeof S);
+    st_init(&S,dir);
+    fprintf(stderr,"  container: %d tensors indexed (headers only, no weights read)\n",S.n);
+
+    int nman=dsv4_manifest_count(&c);
+    DSV4Tensor *man=(DSV4Tensor*)xalloc((size_t)nman*sizeof(DSV4Tensor),"manifest");
+    if(dsv4_manifest(&c,man,nman)!=nman){ fprintf(stderr,"  FAIL  internal: manifest count disagrees with the walk\n"); return 1; }
+    fprintf(stderr,"  manifest: %d tensors expected\n\n",nman);
+
+    unsigned char *seen=(unsigned char*)xzalloc((size_t)S.n,"seen map");
+    int missing=0, badsize=0, badscale=0, ok=0, shown=0;
+    #define PF_SHOW(...) do{ if(shown<20){ fprintf(stderr,__VA_ARGS__); shown++; } \
+                             else if(shown==20){ fprintf(stderr,"  ... (further problems suppressed)\n"); shown++; } }while(0)
+
+    for(int i=0;i<nman;i++){
+        DSV4Tensor *t=&man[i];
+        st_tensor *st=st_find(&S,t->name);
+        if(!st){
+            if(!t->optional){ missing++; PF_SHOW("  MISSING   %s  [%lld,%lld]\n",
+                t->name,(long long)t->d0,(long long)t->d1); }
+            continue;
+        }
+        seen[st - S.t]=1;
+        /* Mark the sidecar as accounted for BEFORE validating the weight: on a
+         * size mismatch we bail out below, and an unmarked sidecar would then
+         * surface in the "not covered by the manifest" list, which reads as a
+         * second, unrelated problem. */
+        st_tensor *ss=NULL;
+        if(t->role==DSV4_T_FP8 || t->role==DSV4_T_FP4){
+            char sn0[192]; snprintf(sn0,sizeof sn0,"%s.scale",t->name);
+            ss=st_find(&S,sn0);
+            if(ss) seen[ss - S.t]=1;
+        }
+        int64_t want=pf_expect_weight(t);
+        if(want>=0 && st->nbytes!=want){
+            badsize++; PF_SHOW("  SIZE      %s  %lld bytes, expected %lld for [%lld,%lld]\n",
+                t->name,(long long)st->nbytes,(long long)want,(long long)t->d0,(long long)t->d1);
+            continue;
+        }
+        if(want<0){   /* PLAIN: accept bf16/f16 (2 bytes) or f32 (4) */
+            int64_t nel=t->d1?t->d0*t->d1:t->d0;
+            if(st->nbytes!=nel*2 && st->nbytes!=nel*4){
+                badsize++; PF_SHOW("  SIZE      %s  %lld bytes, expected %lld (bf16) or %lld (f32)\n",
+                    t->name,(long long)st->nbytes,(long long)(nel*2),(long long)(nel*4));
+                continue;
+            }
+        }
+        /* scale sidecar, where the role has one */
+        if(t->role==DSV4_T_FP8 || t->role==DSV4_T_FP4){
+            if(!ss){
+                badscale++; PF_SHOW("  NO SCALE  %s.scale is absent\n",t->name);
+                continue;
+            }
+            int64_t I=t->d1?t->d1:1;
+            int64_t nblk = (t->role==DSV4_T_FP8)
+                         ? dsv4_nblk128(t->d0)*dsv4_nblk128(I)
+                         : t->d0*((I+31)/32);
+            int fp8_f32 = (t->role==DSV4_T_FP8 && ss->nbytes==nblk*4);
+            if(ss->nbytes!=nblk && !fp8_f32){
+                badscale++; PF_SHOW("  SCALE     %s.scale is %lld bytes, expected %lld (ue8m0)%s\n",
+                    t->name,(long long)ss->nbytes,(long long)nblk,
+                    t->role==DSV4_T_FP8 ? " or 4x that (f32)" : "");
+                continue;
+            }
+        }
+        ok++;
+    }
+
+    int extra=0;
+    for(int i=0;i<S.n;i++) if(!seen[i]) extra++;
+    if(extra){
+        fprintf(stderr,"\n  %d container tensor(s) the manifest does not cover — "
+                       "EXPECTED, not an error:\n",extra);
+        int e=0;
+        for(int i=0;i<S.n && e<6;i++) if(!seen[i]){ fprintf(stderr,"    %s\n",S.t[i].name); e++; }
+        if(extra>6) fprintf(stderr,"    ... and %d more\n",extra-6);
+        fprintf(stderr,"  (the MTP head is the known case: it exists in the checkpoint,\n"
+                       "   the reference does not build it, so its names are unknown here)\n");
+    }
+
+    char tp[2100]; snprintf(tp,sizeof tp,"%s/tokenizer.json",dir);
+    FILE *tf=fopen(tp,"rb"); int have_tok = tf!=NULL; if(tf) fclose(tf);
+
+    int bad = missing+badsize+badscale;
+    fprintf(stderr,"\n  %d/%d matched", ok, nman);
+    if(missing)  fprintf(stderr,", %d missing",missing);
+    if(badsize)  fprintf(stderr,", %d wrong size",badsize);
+    if(badscale) fprintf(stderr,", %d scale problems",badscale);
+    fprintf(stderr,"  (%.1fs)\n",now_s()-t0);
+    if(!have_tok)
+        fprintf(stderr,"  tokenizer.json absent — install one before running:\n"
+                       "    python3 tools/dsv4_tokenizer.py %s --from <tokenizer.json>\n",dir);
+    fprintf(stderr,"\n  %s\n", bad ? "PREFLIGHT FAILED — the checkpoint does not match what this engine expects."
+                                   : have_tok ? "PREFLIGHT OK — shapes and names check out."
+                                              : "PREFLIGHT OK on weights; the tokenizer is still missing.");
+    free(seen); free(man); free(buf); free(arena);
+    #undef PF_SHOW
+    return bad ? 1 : 0;
+}
+
 static void usage(const char *p){
     fprintf(stderr,
       "usage: %s <model_dir> \"prompt\" [--ngen N] [--temp T] [--expert-gb G] [--max-seq N]\n"
       "       %s <model_dir> \"3,7,1\" --ids [--dump-logits out.json]   (oracle mode, no tokenizer)\n"
-      "  DeepSeek-V4-Flash (284B MoE, 13B active). UNVERIFIED -- see the header comment.\n",p,p);
+      "       %s <model_dir> --preflight     (check names and shapes, read no weights)\n"
+      "  DeepSeek-V4-Flash (284B MoE, 13B active). UNVERIFIED -- see the header comment.\n",p,p,p);
 }
 
 int main(int argc, char **argv){
-    if(argc<3){ usage(argv[0]); return 1; }
-    const char *dir=argv[1], *prompt=argv[2];
-    for(int i=3;i<argc;i++){
+    if(argc<2){ usage(argv[0]); return 1; }
+    const char *dir=argv[1];
+    const char *prompt = (argc>2 && argv[2][0]!='-') ? argv[2] : "";
+    for(int i=(argc>2 && argv[2][0]!='-')?3:2; i<argc; i++){
         if(!strcmp(argv[i],"--ngen")   && i+1<argc) g_ngen=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--temp")  && i+1<argc) g_temp=(float)atof(argv[++i]);
         else if(!strcmp(argv[i],"--expert-gb")&&i+1<argc) g_expert_gb=(float)atof(argv[++i]);
         else if(!strcmp(argv[i],"--max-seq")&&i+1<argc) g_max_seq=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--quiet")) g_verbose=0;
         else if(!strcmp(argv[i],"--ids")) g_ids_mode=1;
+        else if(!strcmp(argv[i],"--preflight")) g_preflight=1;
         else if(!strcmp(argv[i],"--dump-logits") && i+1<argc) g_dump=argv[++i];
         else { usage(argv[0]); return 1; }
     }
@@ -897,8 +1045,10 @@ int main(int argc, char **argv){
     omp_tune_threads();
 #endif
 
-    static Model m; memset(&m,0,sizeof m);
     fprintf(stderr,"  deepseek_v4 — 284B MoE, 13B active (UNVERIFIED build)\n");
+    if(g_preflight) return preflight(dir);
+
+    static Model m; memset(&m,0,sizeof m);
     model_load(&m,dir);
 
     int *ids=(int*)xalloc((size_t)(g_max_seq+8)*sizeof(int),"prompt ids");
