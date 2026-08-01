@@ -423,9 +423,12 @@ static void matmul_i3(float *y, const float *x, const uint8_t *q3, const float *
  * exactly, which is the authoritative reference for how Z.ai's checkpoints read
  * on the source side. This f32 encoding is a declared PROPERTY of the format,
  * not the only one it can carry -- DeepSeek-V4 ships this identical weight
- * geometry with UE8M0 (1-byte, power-of-two) block scales instead; qt_resolve_fmt
- * recognizes that byte signature and refuses it BY NAME rather than
- * misreading it as f32 (UE8M0 decode itself is not implemented in this build).
+ * geometry with UE8M0 (1-byte, power-of-two) block scales instead. BOTH
+ * encodings are now decodable: see FP8_SENC_F32/FP8_SENC_UE8M0 and
+ * ue8m0_decode below, and qt_resolve_fmt in colibri.c for how the two byte
+ * signatures are told apart. A ue8m0 sidecar is expanded to f32 ONCE at load
+ * time, so this kernel and every backend kernel see one representation and
+ * need no ue8m0 branch of their own.
  *
  * 256-entry decode LUT, cross-checked byte-for-byte against PyTorch's
  * torch.float8_e4m3fn (the exact dtype safetensors reports for these shards):
@@ -481,6 +484,68 @@ static inline float e4m3_decode(uint8_t b){ return E4M3_LUT[b]; }
 
 #define FP8_BLOCK 128
 static inline int64_t fp8_nblk(int n){ return ((int64_t)n + FP8_BLOCK - 1) / FP8_BLOCK; }
+
+/* ---- fmt=8 SCALE ENCODINGS ------------------------------------------------
+ * fmt=8 names a WEIGHT geometry (O*I raw e4m3 bytes + one scale per 128x128
+ * block); the ENCODING of that scale array is a separate, declared property of
+ * the container, NOT a second format. Two encodings ship in the wild over this
+ * identical weight layout:
+ *
+ *   FP8_SENC_F32   4 bytes/block, plain float32. Z.ai's GLM-5.2-FP8 checkpoints
+ *                  (`weight_scale_inv`), and what tools/repack_fp8_passthrough.py
+ *                  emits.
+ *   FP8_SENC_UE8M0 1 byte/block, a bare power-of-two exponent. DeepSeek-V4
+ *                  declares it in config.json as
+ *                  quantization_config = { "quant_method": "fp8", "fmt": "e4m3",
+ *                  "scale_fmt": "ue8m0", "weight_block_size": [128,128] };
+ *                  safetensors reports the sidecar dtype as F8_E8M0.
+ *
+ * Keeping this an ENCODING rather than minting a new ordinal is deliberate.
+ * The two would be a near-duplicate format (same weight bytes, same block
+ * grid, same dequant algebra, same kernels), and this repo's PRIVATE ORDINAL
+ * BLOCK convention exists precisely because ordinals are expensive and
+ * collision-prone -- fmt=8 was renumbered twice already. qt_resolve_fmt
+ * reports the encoding through its own out-parameter so exactly ONE place
+ * decides it, the same single-source-of-truth discipline qt_wire_split was
+ * introduced to enforce after the #528 finding. */
+#define FP8_SENC_F32   0
+#define FP8_SENC_UE8M0 1
+
+/* UE8M0 block-scale decode: no sign, no mantissa, bias 127 -> scale = 2^(e-127).
+ *
+ * EXACTNESS. Every decodable exponent lands on a float32 the format holds
+ * without rounding: e in [1,254] -> 2^-126..2^127, all normal; e=0 -> 2^-127,
+ * which is SUBNORMAL in float32 but still exact (2^-127 == 2^22 * 2^-149, and
+ * float32 subnormals reach down to 2^-149). That is what licenses this build's
+ * strategy of expanding a ue8m0 sidecar to f32 once at LOAD time
+ * (qt_from_disk's fmt==8 branch): the expansion is lossless, so matmul_fp8,
+ * the Metal fmt=8 kernel, and qt_bytes/qt_scale_bytes' resident-byte math all
+ * stay byte-for-byte unchanged and keep the coverage they already have. A
+ * kernel that consumed the raw u8 instead would have to re-derive 2^(e-127)
+ * per block on every matmul, for no accuracy gain and a duplicated code path
+ * per backend.
+ *
+ * e=255 is NaN per OCP E8M0 -- with zero mantissa bits there is no infinity
+ * encoding, 0xFF is the single reserved code. It decodes to a real IEEE NaN
+ * and is left to propagate, exactly the policy E4M3_LUT documents for e4m3's
+ * own 0x7F/0xFF: the sampler's existing, tested NaN net (argmax_v/dist_build,
+ * tests/test_logit_nan.c) is the one safety net, not a second weight-level
+ * scrub here.
+ *
+ * ldexpf rather than a 256-entry static LUT: this runs once per BLOCK at load
+ * time and never inside matmul_fp8's `#pragma omp parallel for`, so E4M3_LUT's
+ * "a lazily-initialized global would race under concurrent first use" argument
+ * does not apply, and a table would cost 1 KB of .rodata to save nothing. */
+static inline float ue8m0_decode(uint8_t e){
+    return e==0xFFu ? (float)NAN : ldexpf(1.0f, (int)e - 127);
+}
+
+/* Expand a raw ue8m0 sidecar (nblk bytes) into the f32 block-scale array every
+ * fmt=8 consumer already expects. Kept next to the decode so the "expand once
+ * at load" contract lives in one place; callers own both buffers. */
+static void fp8_ue8m0_expand(float *out, const uint8_t *in, int64_t nblk){
+    for(int64_t i=0;i<nblk;i++) out[i]=ue8m0_decode(in[i]);
+}
 
 /* y[S,O] = x[S,I] @ W^T, W raw e4m3 bytes (byte-identical layout to fmt=1) +
  * per-128x128-BLOCK f32 scale [ceil(O/128),ceil(I/128)]. Scalar reference path

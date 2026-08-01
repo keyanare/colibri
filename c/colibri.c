@@ -137,11 +137,13 @@ typedef struct {
  * (row-major: block-row-major then block-col), NOT O and NOT O*ceil(I/gs) --
  * qt_bytes()/qt_scale_bytes() below are the authoritative byte-count formulas. The
  * scale ENCODING is itself a declared PROPERTY of this format, not a hardcoded
- * constant -- f32 (4 bytes/block, what's above) is the value THIS build
- * implements; qt_resolve_fmt's "SCALE ENCODING IS A DECLARED PROPERTY" comment
- * documents why (a DeepSeek-V4 checkpoint ships this identical weight geometry
- * with a UE8M0 scale encoding instead) and how an unimplemented encoding is
- * recognized and refused by name rather than silently misread.
+ * constant, and BOTH encodings this geometry ships with are now decodable:
+ * f32 (4 bytes/block, what's above -- Z.ai's GLM-5.2-FP8) and UE8M0 (1 byte/
+ * block, a power-of-two exponent -- DeepSeek-V4's checkpoints, dtype F8_E8M0).
+ * qt_resolve_fmt's "SCALE ENCODING IS A DECLARED PROPERTY" comment documents
+ * how the two byte signatures are told apart; QT.senc below records which one
+ * a tensor came from, and t->s is f32 in memory either way (the ue8m0 sidecar
+ * is expanded losslessly at load -- see ue8m0_decode in quant.h).
  * gs is unused (0) for fmt=8, same as fmt 1/2/3. */
 /* ---- PRIVATE ORDINAL BLOCK CONVENTION ------------------------------------
  * fmt values 0-8 are upstream-assigned, public, stable ordinals -- do not
@@ -180,6 +182,16 @@ typedef struct {
  * two renumbers demonstrate. */
 typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
+    /* senc: fmt=8 only -- which ENCODING the scale array had ON DISK
+     * (FP8_SENC_F32 / FP8_SENC_UE8M0, quant.h). Purely a record of provenance:
+     * t->s is ALWAYS f32 in memory, because qt_from_disk expands a ue8m0
+     * sidecar exactly once at load (lossless, see ue8m0_decode's EXACTNESS
+     * note). Nothing downstream -- matmul_fp8, the Metal fmt=8 branch,
+     * qt_bytes, qt_scale_bytes, qt_wire_split -- may branch on it; they all
+     * see one representation, which is the whole point of expanding early.
+     * 0 (=FP8_SENC_F32) for every other fmt, and for fmt=8 containers that
+     * carried f32 scales. */
+    int senc;
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
 #endif
@@ -1325,11 +1337,13 @@ static int detect_group_size(int O, int I, int64_t ns){
  * qt_fmt_by_name/qt_name_by_fmt are total over every value qt_resolve_fmt can
  * return, matching this comment's own claim; a real name for fmt=6 belongs to
  * whoever upstreams a stamp for it. "fp8-e4m3-b128" (fmt=8) names the WEIGHT
- * geometry only, not a specific scale encoding -- a tensor stamped
- * "fp8-e4m3-b128" whose scale sidecar carries UE8M0 bytes still refuses (see
- * qt_resolve_fmt's "SCALE ENCODING IS A DECLARED PROPERTY" comment): the stamp
- * confirms the WEIGHT format, it does not grant this build a decoder it
- * doesn't have. */
+ * geometry only, not a specific scale encoding -- it covers BOTH the f32 and
+ * the UE8M0 block-scale encodings, which this build can now decode (see
+ * qt_resolve_fmt's "SCALE ENCODING IS A DECLARED PROPERTY" comment and
+ * quant.h's FP8_SENC_*). That is deliberate and is why no second NAME was
+ * minted here: the encoding is recoverable from the sidecar's byte count
+ * alone, so a stamp never has to carry it, and a container stamped by an
+ * older tool stays readable when a new encoding is added. */
 static const struct { const char *name; int fmt; } FMT_NAMES[] = {
     { "f32",           0 },
     { "int8-row",      1 },
@@ -1370,7 +1384,21 @@ static const char *qt_name_by_fmt(int fmt){
  * (expert_load_impl and friends) always pass NULL: this branch's repack
  * tool never stamps routed experts, so there is nothing for those paths to
  * consult. */
-static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns, int *gs, const char *stamped_name){
+static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns, int *gs,
+                          const char *stamped_name, int *senc){
+    /* `senc` (out, may be NULL): for fmt=8, which SCALE ENCODING the container
+     * carried -- FP8_SENC_F32 or FP8_SENC_UE8M0 (quant.h). Always written when
+     * non-NULL, and always FP8_SENC_F32 for any format that isn't fmt=8, so a
+     * caller never reads a stale value. This function is the ONE place that
+     * decides the encoding: it already does the byte arithmetic that
+     * distinguishes them, and a second site re-deriving it from (O,I,ns) is
+     * exactly the drift qt_wire_split was introduced to end after #528.
+     * A caller passing NULL is asserting it cannot consume a ue8m0 container
+     * (see the routed-expert zero-copy path); such callers must refuse it
+     * rather than mis-map the sidecar, and the refusal below enforces that. */
+    int senc_local = FP8_SENC_F32;
+    if(senc) *senc = FP8_SENC_F32;
+    #define SENC_SET(v) do{ senc_local=(v); if(senc) *senc=(v); }while(0)
     int64_t exp_i8=(int64_t)O*I, exp_i4=(int64_t)O*((I+1)/2), exp_i2=(int64_t)O*((I+3)/4);
     int64_t exp_i3=(int64_t)O*i3_rowbytes(I);   /* int3-g64 (fmt=5): 24B per 64-input group */
     /* fmt=6 (E8/IQ3, #452): scales live inside the 98B super-blocks, so the .qs
@@ -1393,11 +1421,16 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
      *     with UE8M0, just against fmt=6's tag instead of fmt=1's per-row
      *     count; see that landmine's own comment for the general shape.
      *   - at O==1 specifically, fmt=1's own per-row tag (O*4) is also 4.
-     * A stamp naming exactly one live candidate resolves the ambiguity --
-     * EXCEPT a "fp8-e4m3-b128" stamp on the UE8M0-shaped candidate: the stamp
-     * confirms the WEIGHT format, not a scale encoding this build can decode,
-     * so that specific case still refuses (same "recognized but not
-     * implemented" discipline as the landmine below). Everything else
+     * A stamp naming exactly one live candidate resolves the ambiguity. That
+     * now INCLUDES a "fp8-e4m3-b128" stamp on the UE8M0-shaped candidate: the
+     * stamp confirms the WEIGHT format, and both of that geometry's scale
+     * encodings are decodable in this build, so the stamp is sufficient here
+     * (it was not, while ue8m0 decode was missing -- the old
+     * "recognized but not implemented" refusal). Note the stamp still cannot
+     * distinguish f32 from ue8m0 by itself; it does not have to, because the
+     * two are mutually exclusive at this shape (fp8_blk_f32_also needs
+     * nblkO*nblkI==1, fp8_blk_ue8m0_also needs ==4), so at most one of the two
+     * fp8 candidates is ever live and the byte count picks it. Everything else
      * (unstamped, or a stamp that doesn't resolve) refuses rather than let
      * dev's own unconditional `return 6` silently misread an fp8-e4m3-b128
      * (or, at O==1, plain int8) tensor as E8/IQ3-lattice-decoded garbage with
@@ -1410,16 +1443,15 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
         if(fp8_blk_f32_also || fp8_blk_ue8m0_also || i8_row_also){
             int sf = stamped_name ? qt_fmt_by_name(stamped_name) : -1;
             if(sf==6){ *gs=0; return 6; }
-            if(sf==8 && fp8_blk_f32_also){ *gs=0; return 8; }
+            if(sf==8 && fp8_blk_f32_also){ *gs=0; SENC_SET(FP8_SENC_F32); return 8; }
+            if(sf==8 && fp8_blk_ue8m0_also){ *gs=0; SENC_SET(FP8_SENC_UE8M0); return 8; }
             if(sf==1 && i8_row_also){ *gs=0; return 1; }
-            /* sf==8 with only fp8_blk_ue8m0_also true falls through here too --
-             * see the comment above this block. */
             fprintf(stderr,"%s: [%d,%d] byte layout (nb=%lld ns=%lld) matches E8/IQ3 "
                 "(fmt=6, 4-byte tag)%s%s%s; refusing rather than guessing (untrusted "
                 "container, fmt=6 collision at I=98)%s\n",
                 name,O,I,(long long)nb,(long long)ns,
                 fp8_blk_f32_also   ? " AND per-128x128-block FP8 f32 scales (fmt=8, single block)" : "",
-                fp8_blk_ue8m0_also ? " AND per-128x128-block FP8 ue8m0 scales (fmt=8, 4 blocks, recognized-not-implemented)" : "",
+                fp8_blk_ue8m0_also ? " AND per-128x128-block FP8 ue8m0 scales (fmt=8, 4 blocks)" : "",
                 i8_row_also        ? " AND plain int8 per-row (fmt=1, O=1)" : "",
                 stamped_name ? " -- metadata stamp present but names a format/encoding that doesn't resolve the ambiguity"
                              : "");
@@ -1491,11 +1523,12 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
      * equal to the f32 block-scale count above for any O,I>=1, since one is
      * exactly 4x the other and 4n==n only at n==0) -- recognized here rather
      * than silently misread as a truncated or corrupt f32 scale array. This
-     * build does not implement UE8M0 decode: recognizing the signature and
-     * refusing BY NAME (rather than falling through to the generic
-     * "wrong byte count" refusal below, or worse, matching it against the
-     * wrong candidate) is the whole point -- a future decoder lands into this
-     * seam rather than a near-duplicate format. Checked for collision against
+     * build DOES implement UE8M0 decode (quant.h's ue8m0_decode, landed into
+     * the seam the earlier revision's recognize-and-refuse-by-name left open):
+     * the signature resolves to fmt=8 with senc=FP8_SENC_UE8M0, and
+     * qt_from_disk expands the sidecar to f32 losslessly at load, so no
+     * near-duplicate ordinal was minted and no kernel gained a second branch.
+     * Checked for collision against
      * every OTHER format's ns arithmetic reachable from this nb==O*I branch
      * (fmt=1 and fmt=8-f32, both above): the byte counts are realistically
      * distinct (nblkO*nblkI is orders of magnitude smaller than O*4 for any
@@ -1503,11 +1536,18 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
      * small-O regime that makes the fmt=1-vs-fmt=8-f32 collision above
      * possible also makes a fmt=1-vs-fmt=8-ue8m0 collision possible (e.g.
      * O=1, I in (384,512]: nblkO=1, nblkI=4, ue8m0 ns=4=O*4=fmt=1's own
-     * per-row count). A stamp naming "int8-row" resolves that specific
-     * corner to fmt=1 (the stamp confirms it really is plain int8, a format
-     * this build CAN decode); a stamp naming "fp8-e4m3-b128" does NOT resolve
-     * it, for the same "recognized but not implemented" reason the clean
-     * (non-colliding) ue8m0 case below refuses regardless of any stamp.
+     * per-row count). Now that BOTH candidates are decodable, that corner is
+     * governed by the SAME INVERSION as the fmt=1-vs-fmt=8-f32 collision
+     * above, for the same reason and with the same escape hatch: unstamped
+     * resolves to fmt=1 (the incumbent, already-on-disk format -- and the
+     * only one this repo's own writer can emit, since
+     * repack_fp8_passthrough.py emits f32 scales exclusively), a stamp naming
+     * "int8-row" confirms fmt=1, and a stamp naming "fp8-e4m3-b128" now
+     * resolves to fmt=8+ue8m0 instead of refusing. Deliberately NOT left as a
+     * refusal: with a decoder present, refusing an ambiguous shape would fail
+     * a valid int8 tensor at load -- the strictly worse failure mode #528
+     * already identified for the f32 collision. Real DeepSeek-V4 tensors are
+     * not members anyway: membership at I<=16384 forces O<=32.
      * The colliding FAMILY is exactly: nb==O*I && ns==O*4 &&
      * ceil(O/128)*ceil(I/128)==4*O (is_row && is_blk_ue8m0 below; is_blk can
      * never co-hold since nblk==O and nblk==4*O are disjoint for O>=1).
@@ -1551,30 +1591,58 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
             }
             /* else (no stamp at all): falls through to fmt=1, the INVERSION. */
         } else if(is_blk_ue8m0){
-            if(sf==1 && is_row){
-                fmt = 1;   /* stamp confirms this is genuinely plain int8, not an
-                            * unimplemented-encoding fp8 tensor -- safe to resolve. */
+            /* The ue8m0 signature. Two sub-cases, mirroring the f32 landmine
+             * above exactly (see this function's "SCALE ENCODING IS A DECLARED
+             * PROPERTY" comment for why the polarity is what it is):
+             *   is_row too -> genuinely ambiguous with plain int8-row. A stamp
+             *     decides; unstamped falls through to fmt=1, the INVERSION.
+             *   clean       -> unambiguously fmt=8 with ue8m0 block scales.
+             * A stamp naming some THIRD format still refuses, same as the f32
+             * collision: the inversion covers the stamp-less case only. */
+            if(is_row){
+                if(sf==1)      fmt=1;
+                else if(sf==8){ fmt=8; SENC_SET(FP8_SENC_UE8M0); }
+                else if(stamped_name){
+                    fprintf(stderr,"%s: [%d,%d] scale array is %lld bytes — matches BOTH per-row "
+                        "int8 (fmt=1) and per-128x128-block FP8 ue8m0 (fmt=8, %lld blocks x 1 "
+                        "byte/block) scale geometry; refusing rather than guessing (untrusted "
+                        "container) -- metadata stamp present but names a format that doesn't "
+                        "resolve the ambiguity\n",
+                        name,O,I,(long long)ns,(long long)(nblkO*nblkI));
+                    exit(1);
+                }
+                /* else (no stamp at all): falls through to fmt=1, the INVERSION. */
             } else {
-                fprintf(stderr,"%s: [%d,%d] fp8-e4m3-b128 with ue8m0 scales recognized but not "
-                    "implemented; only f32 block scales are supported in this build (nb=%lld "
-                    "bytes matches raw e4m3 weight bytes, ns=%lld bytes matches %lld blocks x "
-                    "1 byte/block)%s%s -- refusing rather than misreading the sidecar "
-                    "(untrusted container)\n",
-                    name,O,I,(long long)nb,(long long)ns,(long long)(nblkO*nblkI),
-                    is_row ? " -- scale array ALSO matches per-row int8 (fmt=1)" : "",
-                    stamped_name ? " -- a metadata stamp cannot grant this build a decoder it doesn't have"
-                                 : "");
-                exit(1);
+                fmt=8; SENC_SET(FP8_SENC_UE8M0);
             }
         } else if(is_blk && !is_row) fmt=8;
     }
     int64_t exp_scale = (fmt==4)? (int64_t)O*((I+*gs-1)/(*gs))
                       : (fmt==5)? (int64_t)O*i3_groups(I)
                       : (fmt==8)? fp8_nblk(O)*fp8_nblk(I)
-                      : (int64_t)O;   /* in FLOAT */
-    if(ns != exp_scale*4){
+                      : (int64_t)O;
+    /* Scale ELEMENT size, not a constant 4: a ue8m0 sidecar is one byte per
+     * block. Every other format (and fmt=8 with f32 scales) is 4. */
+    int64_t esz = (fmt==8 && senc_local==FP8_SENC_UE8M0) ? 1 : 4;
+    if(ns != exp_scale*esz){
         fprintf(stderr,"%s: scale array is %lld bytes — expected %lld for [%d,%d] fmt=%d, refusing (untrusted container)\n",
-                name,(long long)ns,(long long)(exp_scale*4),O,I,fmt); exit(1); }
+                name,(long long)ns,(long long)(exp_scale*esz),O,I,fmt); exit(1); }
+    /* A NULL `senc` caller cannot represent a ue8m0 container (it has nowhere
+     * to record that the sidecar needs expanding, and every such call site in
+     * this engine hands the scale bytes onward as f32 -- see the routed-expert
+     * zero-copy mmap path, which publishes t->s as a pointer straight INTO the
+     * mapped file). Reinterpreting 1-byte exponents as f32 there would be a
+     * silent, catastrophic misread of the whole tensor, so refuse by name
+     * instead -- the same discipline the rest of this function applies. */
+    if(fmt==8 && senc_local==FP8_SENC_UE8M0 && !senc){
+        fprintf(stderr,"%s: [%d,%d] fp8-e4m3-b128 with ue8m0 block scales is not supported on "
+            "this load path (it publishes scales as a zero-copy f32 view of the container, and "
+            "ue8m0 needs a decode pass); refusing rather than misreading the sidecar. Routed "
+            "experts in a ue8m0 container must be repacked to f32 block scales first.\n",
+            name,O,I);
+        exit(1);
+    }
+    #undef SENC_SET
     return fmt;
 }
 
@@ -1631,9 +1699,9 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
         /* fmt=4 int4-grouped: byte int4 ma scala > O*4 — gs deriva dalla scala.
          * qt_resolve_fmt valida entrambi i conteggi contro [O,I] e termina se
          * non fidati (SEC). */
-        int gs=0;
+        int gs=0, senc=FP8_SENC_F32;
         const char *stamped = st_fmt_stamp(&m->S,name);   /* NULL if unstamped */
-        int fmt = qt_resolve_fmt(name,O,I,nb,ns,&gs,stamped);
+        int fmt = qt_resolve_fmt(name,O,I,nb,ns,&gs,stamped,&senc);
         qt_verify_fmt_stamp(name,stamped,fmt);   /* TRUST-VERIFY-REFUSE: no-op if unstamped */
         if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
         else if(fmt==4){ int ng=(I+gs-1)/gs;
@@ -1663,6 +1731,7 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
             * from day one -- the GPU-visibility lesson fmt=4 and fmt=5 each had to learn
             * separately (see review round 1 audit history in the report). */
             if(t->fmt!=8||!t->q8){ t->fmt=8; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=(float*)qalloc((size_t)nblk*sizeof(float)); }
+            t->senc=senc;   /* provenance only: t->s below is f32 either way */
             st_read_raw(&m->S,name,t->q8,drop); }
         else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
         /* cap MUST match the scale cardinality qt_resolve_fmt already validated and
@@ -1672,6 +1741,27 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
          * block scales; everything else is per-row O. Using the per-row bound for a
          * grouped/blocked format would reject a legitimate container (fmt=5 regressed
          * exactly that way). */
+        if(fmt==8 && senc==FP8_SENC_UE8M0){
+            /* ue8m0 sidecar: 1 opaque byte per block, so it cannot go through
+             * st_read_f32_cap (that path converts BF16/F16/F32 ELEMENTS and
+             * would reject a dtype-3 tensor on its own numel*esz check). Read
+             * the bytes raw, expand ONCE into the f32 block-scale array every
+             * downstream consumer already expects, and free the staging
+             * buffer -- from here on a ue8m0 tensor is indistinguishable from
+             * an f32-scaled one, which is exactly why no kernel, no backend
+             * and no byte-accounting function needed a ue8m0 branch.
+             * The byte count was already validated against ceil(O/128)*
+             * ceil(I/128) by qt_resolve_fmt; re-checking here keeps the
+             * staging buffer's bound local and provable rather than
+             * action-at-a-distance. */
+            int64_t nblk=fp8_nblk(O)*fp8_nblk(I);
+            if(ns!=nblk){ fprintf(stderr,"%s: ue8m0 scale sidecar is %lld bytes, expected %lld\n",
+                                  sn,(long long)ns,(long long)nblk); exit(1); }
+            uint8_t *raw=(uint8_t*)xalloc((size_t)nblk,"ue8m0 scale staging");
+            st_read_raw(&m->S,sn,raw,drop);
+            fp8_ue8m0_expand(t->s,raw,nblk);
+            free(raw);
+        } else
         st_read_f32_cap(&m->S,sn,t->s,
                         fmt==4 ? (int64_t)O*((I+gs-1)/gs) :
                         fmt==5 ? (int64_t)O*i3_groups(I)  :
@@ -2202,7 +2292,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
             for(int k=0;k<3;k++){
                 int64_t nb=tw[k]->nbytes;
                 int gs=0;
-                int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,NULL);   /* routed expert: never stamped */
+                int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,NULL,NULL);   /* routed expert: never stamped; NULL senc = this zero-copy path cannot consume ue8m0 (refused inside) */
                 qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
@@ -2371,7 +2461,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     for(int k=0;k<3;k++){
         int64_t nb=tw[k]->nbytes;
         int gs=0;
-        int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,NULL);   /* routed expert: never stamped */
+        int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,NULL,NULL);   /* routed expert: never stamped; NULL senc = this zero-copy path cannot consume ue8m0 (refused inside) */
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }

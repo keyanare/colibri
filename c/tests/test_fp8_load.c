@@ -74,8 +74,10 @@
  * TRUST-VERIFY-REFUSE), and Part D covers the four stamp outcomes on an
  * otherwise-unambiguous tensor (agreeing/mismatching/unrecognized-name/
  * absent). A stamp can never grant this build a decoder it doesn't have:
- * Part A3's UE8M0 refusals stay refusals even when correctly stamped
- * "fp8-e4m3-b128" (see test_ue8m0_scale_refusal's stamped cases). */
+ * a stamp cannot invent one. Part A3 pinned that while ue8m0 decode was
+ * missing; now that it exists, those cases resolve instead (see
+ * test_ue8m0_scale_decode) -- the principle is unchanged, the inventory of
+ * decoders is not. */
 /* WIRE-SITE REGRESSION SEAM (FIX ROUND, validator finding). First attempt
  * (superseded, kept as a note): renaming mem_wire() itself via macro does
  * NOT work as an observer seam -- mem_wire is a real, internally-defined
@@ -169,15 +171,31 @@ static uint8_t rndbyte_nonan(void){
  * cases, fork+waitpid for refusing ones -- qt_resolve_fmt exit(1)s in place,
  * it does not return an error code). ---- */
 
-static int expect_fmt_stamped(int O, int I, int64_t nb, int64_t ns, const char *stamped_name, int expect_fmt_val, const char *tag){
-    int gs=0;
-    int fmt = qt_resolve_fmt(tag, O, I, nb, ns, &gs, stamped_name);
+/* Every resolver assertion goes through here: `expect_senc` is the SCALE
+ * ENCODING (quant.h's FP8_SENC_*) the container is expected to have carried.
+ * Checked on every case, not just the fp8 ones -- qt_resolve_fmt promises to
+ * write FP8_SENC_F32 for any format that isn't a ue8m0 fmt=8, and a resolver
+ * that leaked a stale FP8_SENC_UE8M0 onto, say, an int8 tensor would make
+ * qt_from_disk read its per-row f32 scales as 1-byte exponents. That is a
+ * silent whole-tensor corruption, so it is pinned everywhere. */
+static int expect_fmt_senc(int O, int I, int64_t nb, int64_t ns, const char *stamped_name,
+                           int expect_fmt_val, int expect_senc, const char *tag){
+    int gs=0, senc=-1;
+    int fmt = qt_resolve_fmt(tag, O, I, nb, ns, &gs, stamped_name, &senc);
     if(fmt != expect_fmt_val){
         printf("FAIL %s: got fmt=%d, expected fmt=%d (O=%d I=%d nb=%lld ns=%lld)\n",
                tag, fmt, expect_fmt_val, O, I, (long long)nb, (long long)ns);
         return 0;
     }
+    if(senc != expect_senc){
+        printf("FAIL %s: got senc=%d, expected senc=%d (O=%d I=%d nb=%lld ns=%lld fmt=%d)\n",
+               tag, senc, expect_senc, O, I, (long long)nb, (long long)ns, fmt);
+        return 0;
+    }
     return 1;
+}
+static int expect_fmt_stamped(int O, int I, int64_t nb, int64_t ns, const char *stamped_name, int expect_fmt_val, const char *tag){
+    return expect_fmt_senc(O, I, nb, ns, stamped_name, expect_fmt_val, FP8_SENC_F32, tag);
 }
 static int expect_fmt(int O, int I, int64_t nb, int64_t ns, int expect_fmt_val, const char *tag){
     return expect_fmt_stamped(O, I, nb, ns, NULL, expect_fmt_val, tag);
@@ -190,8 +208,8 @@ static int expect_refuse_stamped(int O, int I, int64_t nb, int64_t ns, const cha
     if(pid < 0) return 0;
     if(pid == 0){
         dup2(pipefd[1],2); close(pipefd[0]); close(pipefd[1]);
-        int gs=0;
-        qt_resolve_fmt(tag, O, I, nb, ns, &gs, stamped_name);   /* must exit(1) inside; must NOT return */
+        int gs=0, senc=-1;
+        qt_resolve_fmt(tag, O, I, nb, ns, &gs, stamped_name, &senc);   /* must exit(1) inside; must NOT return */
         _exit(42);                                  /* reaching here is the bug */
     }
     close(pipefd[1]);
@@ -351,18 +369,21 @@ static void test_fmt6_fp8_collision(void){
 
     /* O in (384,512], I=98: nblkO=4, nblkI=1, product=4 -- a fmt=8 tensor with
      * UE8M0 (1 byte/block) scales also lands at ns==4*1==4 here, the SAME tag
-     * fmt=6 uses. Unstamped: must refuse. Stamped "e8-iq3-lattice": resolves to
-     * fmt=6 (a real, decodable format). Stamped "fp8-e4m3-b128": still refuses
-     * -- the stamp confirms the WEIGHT format, but this build has no UE8M0
-     * decoder, so it cannot grant a resolution the byte layout itself can't
-     * support (contrast the [64,98]/[128,98] cases above, where the SAME stamp
-     * name resolves cleanly because those are the f32-scaled candidate). */
+     * fmt=6 uses. Unstamped: must refuse (a genuine three-way ambiguity, and
+     * unlike the fmt=1 collisions there is no "incumbent already on disk" to
+     * invert toward -- fmt=6 and fmt=8 are equally real candidates). Each
+     * stamp resolves to the candidate it names, including "fp8-e4m3-b128" ->
+     * fmt=8 + senc=ue8m0, which REFUSED before the ue8m0 decoder existed.
+     * Note the stamp does not have to say WHICH encoding: at this shape only
+     * the 4-block ue8m0 candidate is live (the f32 one needs nblkO*nblkI==1),
+     * so the byte count settles it -- contrast the [64,98]/[128,98] cases
+     * above, where the same stamp name resolves to the f32-scaled candidate. */
     int64_t nb400=(int64_t)400*98;
     CHECK(expect_refuse(400,98, nb400, 4, "fmt=6/fmt=8(ue8m0, 4-block) collision O=400 I=98 (unstamped)"));
     CHECK(expect_fmt_stamped(400,98, nb400, 4, "e8-iq3-lattice", 6,
         "fmt=6/fmt=8(ue8m0) collision O=400 I=98, stamped e8-iq3-lattice -> resolves to fmt=6"));
-    CHECK(expect_refuse_stamped(400,98, nb400, 4, "fp8-e4m3-b128",
-        "fmt=6/fmt=8(ue8m0) collision O=400 I=98, stamped fp8-e4m3-b128 -> STILL refuses (no ue8m0 decoder)"));
+    CHECK(expect_fmt_senc(400,98, nb400, 4, "fp8-e4m3-b128", 8, FP8_SENC_UE8M0,
+        "fmt=6/fmt=8(ue8m0) collision O=400 I=98, stamped fp8-e4m3-b128 -> fmt=8, senc=ue8m0"));
 
     /* regression guard: a GENUINE (non-colliding) fmt=6 fixture -- I!=98, so
      * e8_rowbytes(I)==98 does NOT equal O*I -- must keep resolving to fmt=6 with
@@ -375,42 +396,50 @@ static void test_fmt6_fp8_collision(void){
         "genuine fmt=6 (non-colliding) O=64 I=256 (I!=98, no collision), unstamped -> fmt=6"));
 }
 
-/* ---- Part A3: fmt=8's scale ENCODING is a declared property -- UE8M0
- * recognized, refused by name (not implemented in this build). A stamp
- * cannot resolve any of these: "fp8-e4m3-b128" confirms the WEIGHT format,
- * not a scale encoding this build can decode, so the stamped cases below
- * refuse exactly like their unstamped counterparts -- the one exception is
- * the small-O collision, where a DIFFERENT stamp ("int8-row", naming the
- * OTHER live candidate) legitimately resolves it, because that candidate
- * really is decodable. ---- */
-static void test_ue8m0_scale_refusal(void){
+/* ---- Part A3: fmt=8's scale ENCODING is a declared property -- and BOTH
+ * encodings are now DECODED, not merely recognized. This Part used to pin the
+ * opposite polarity (recognize-and-refuse-by-name, while no ue8m0 decoder
+ * existed); the decoder landed into exactly the seam that refusal was holding
+ * open, so every case here flipped from expect_refuse to a resolution
+ * carrying FP8_SENC_UE8M0. What did NOT change: an ambiguous shape still
+ * needs a stamp, and a stamp naming an unrelated format still refuses. ---- */
+static void test_ue8m0_scale_decode(void){
     /* [2048,6144] (spec example shape, same as Part A's fmt=8/f32 golden
      * path): nblkO=16, nblkI=48, product=768 blocks. A UE8M0 sidecar is
      * exactly 1 byte/block -> ns=768, distinct from BOTH fmt=1's per-row
-     * count (O*4=8192) and this build's f32 block-scale count (768*4=3072).
-     * Clean, unambiguous UE8M0 signature -- must name-refuse, not silently
-     * treat it as a truncated/corrupt f32 array or match it to fmt=1. */
+     * count (O*4=8192) and the f32 block-scale count (768*4=3072). Clean,
+     * unambiguous UE8M0 signature: resolves to fmt=8 + FP8_SENC_UE8M0 with
+     * no stamp needed, because the byte count alone identifies it. This is
+     * the shape a real DeepSeek-V4 dense tensor actually presents. */
     int64_t nb=(int64_t)2048*6144;
-    CHECK(expect_refuse(2048,6144, nb, 768,
-        "fp8-e4m3-b128 with ue8m0 scales (spec-shaped, non-degenerate), unstamped -> recognized, refused by name"));
-    CHECK(expect_refuse_stamped(2048,6144, nb, 768, "fp8-e4m3-b128",
-        "fp8-e4m3-b128 with ue8m0 scales, stamped fp8-e4m3-b128 -> STILL refuses (stamp names the weight format, not a decoder)"));
+    CHECK(expect_fmt_senc(2048,6144, nb, 768, NULL, 8, FP8_SENC_UE8M0,
+        "fp8-e4m3-b128 + ue8m0 scales (spec-shaped, non-degenerate), unstamped -> fmt=8, senc=ue8m0"));
+    CHECK(expect_fmt_senc(2048,6144, nb, 768, "fp8-e4m3-b128", 8, FP8_SENC_UE8M0,
+        "same, stamped fp8-e4m3-b128 -> fmt=8, senc=ue8m0 (stamp agrees; encoding still comes from the byte count)"));
+    /* The f32 sidecar at the SAME shape must keep resolving to senc=f32 --
+     * the two encodings are distinguished ONLY by this byte count, so pinning
+     * one without the other would not catch a swapped comparison. */
+    CHECK(expect_fmt_senc(2048,6144, nb, 768*4, NULL, 8, FP8_SENC_F32,
+        "same shape, f32 sidecar (768*4 bytes) -> fmt=8, senc=f32 (the discriminator is the byte count)"));
 
     /* O=1, I=400: nblkO=1, nblkI=ceil(400/128)=4, product=4 -- a UE8M0 sidecar
      * here is ns=4*1=4, which ALSO equals fmt=1's per-row count (O*4=4): the
      * same small-O regime that produces the f32-vs-fmt=1 collision in Part A
-     * produces a ue8m0-vs-fmt=1 collision too. Unstamped: must still refuse
-     * (combined message), not silently pick fmt=1. Stamped "int8-row" DOES
-     * resolve it -- that candidate is real, decodable plain int8, and the
-     * stamp confirms it's the one on disk. Stamped "fp8-e4m3-b128" does NOT
-     * resolve it -- same "no decoder" refusal as the clean case above. */
+     * produces a ue8m0-vs-fmt=1 collision too. Now that both candidates are
+     * decodable this follows the SAME INVERSION as Part A's f32 collision:
+     * unstamped -> fmt=1 (the incumbent, and the only encoding this repo's
+     * own writer emits), and each stamp resolves to the candidate it names. */
     int64_t nb1=(int64_t)1*400;
-    CHECK(expect_refuse(1,400, nb1, 4,
-        "fp8-e4m3-b128 with ue8m0 scales, ALSO colliding with fmt=1 per-row (O=1), unstamped -> refused"));
-    CHECK(expect_fmt_stamped(1,400, nb1, 4, "int8-row", 1,
-        "ue8m0/fmt=1 collision O=1 I=400, stamped int8-row -> resolves to fmt=1 (real, decodable candidate)"));
-    CHECK(expect_refuse_stamped(1,400, nb1, 4, "fp8-e4m3-b128",
-        "ue8m0/fmt=1 collision O=1 I=400, stamped fp8-e4m3-b128 -> STILL refuses (no ue8m0 decoder)"));
+    CHECK(expect_fmt_senc(1,400, nb1, 4, NULL, 1, FP8_SENC_F32,
+        "ue8m0/fmt=1 collision O=1 I=400, unstamped -> fmt=1 (INVERSION: incumbent wins)"));
+    CHECK(expect_fmt_senc(1,400, nb1, 4, "int8-row", 1, FP8_SENC_F32,
+        "ue8m0/fmt=1 collision O=1 I=400, stamped int8-row -> fmt=1"));
+    CHECK(expect_fmt_senc(1,400, nb1, 4, "fp8-e4m3-b128", 8, FP8_SENC_UE8M0,
+        "ue8m0/fmt=1 collision O=1 I=400, stamped fp8-e4m3-b128 -> fmt=8, senc=ue8m0 (now resolvable)"));
+    /* A stamp naming a THIRD, unrelated format still refuses -- the inversion
+     * covers the stamp-LESS case only, exactly as it does for f32. */
+    CHECK(expect_refuse_stamped(1,400, nb1, 4, "int4-grouped",
+        "ue8m0/fmt=1 collision, stamped with an unrelated format -> still refuses"));
 }
 
 /* ---- Part A3b (fix round 1): the ue8m0-vs-fmt=1 unstamped-refusal FAMILY,
@@ -420,26 +449,32 @@ static void test_ue8m0_scale_refusal(void){
  * nblk==O and nblk==4*O are disjoint for O>=1). The [1,400] case above is
  * the O=1 member; these pin O=2 (nblkO=1) and O=129 (nblkO=2, past the
  * block edge) so the family's O-dependence is exercised, not one corner.
- * CURRENT POLARITY, pinned deliberately: an UNSTAMPED tensor whose bytes
- * are genuine plain int8 at a member shape REFUSES here (the named ue8m0
- * refusal, carrying its "ALSO matches per-row int8" clause), while a build
- * without this PR's fp8 branches loads the same bytes as fmt=1 -- this is
- * a knowing, disclosed strictness trade for untrusted containers, and the
- * stamp ("int8-row") is the designed escape hatch, verified here too.
+ * POLARITY, flipped when the ue8m0 decoder landed: an UNSTAMPED tensor at a
+ * member shape now resolves to fmt=1, matching what a build WITHOUT any fp8
+ * branches would do with the same bytes. The previous revision refused here
+ * (a disclosed strictness trade, made while fmt=8+ue8m0 was undecodable and
+ * therefore never a legitimate resolution); with a decoder present that trade
+ * has no upside left, and refusing would fail a valid int8 tensor at load --
+ * the strictly worse failure mode #528 identified for the f32 collision.
+ * Both stamps are now escape hatches, in opposite directions, verified here.
  * No GLM-5.2 resident tensor is a member: at I<=16384 (nblkI<=128),
  * membership forces O<=32, and every repack-eligible GLM-5.2 role has
  * O>=576 (tools/fp8_collision_census.py enumerates the roles). */
 static void test_ue8m0_family_sweep(void){
     /* [2,1024]: nblkO=1, nblkI=8 -> nblk=8 == 4*O. ns = O*4 = nblk = 8. */
-    CHECK(expect_refuse(2,1024, (int64_t)2*1024, 8,
-        "ue8m0 family [2,1024] (nblk=8==4*O), unstamped int8-shaped -> refuses (current polarity)"));
-    CHECK(expect_fmt_stamped(2,1024, (int64_t)2*1024, 8, "int8-row", 1,
-        "ue8m0 family [2,1024], stamped int8-row -> resolves to fmt=1 (the escape hatch)"));
+    CHECK(expect_fmt_senc(2,1024, (int64_t)2*1024, 8, NULL, 1, FP8_SENC_F32,
+        "ue8m0 family [2,1024] (nblk=8==4*O), unstamped -> fmt=1 (INVERSION)"));
+    CHECK(expect_fmt_senc(2,1024, (int64_t)2*1024, 8, "int8-row", 1, FP8_SENC_F32,
+        "ue8m0 family [2,1024], stamped int8-row -> fmt=1"));
+    CHECK(expect_fmt_senc(2,1024, (int64_t)2*1024, 8, "fp8-e4m3-b128", 8, FP8_SENC_UE8M0,
+        "ue8m0 family [2,1024], stamped fp8-e4m3-b128 -> fmt=8, senc=ue8m0"));
     /* [129,33000]: nblkO=2, nblkI=258 -> nblk=516 == 4*129. ns = 516. */
-    CHECK(expect_refuse(129,33000, (int64_t)129*33000, 516,
-        "ue8m0 family [129,33000] (nblk=516==4*O, nblkO=2), unstamped int8-shaped -> refuses (current polarity)"));
-    CHECK(expect_fmt_stamped(129,33000, (int64_t)129*33000, 516, "int8-row", 1,
-        "ue8m0 family [129,33000], stamped int8-row -> resolves to fmt=1"));
+    CHECK(expect_fmt_senc(129,33000, (int64_t)129*33000, 516, NULL, 1, FP8_SENC_F32,
+        "ue8m0 family [129,33000] (nblk=516==4*O, nblkO=2), unstamped -> fmt=1 (INVERSION)"));
+    CHECK(expect_fmt_senc(129,33000, (int64_t)129*33000, 516, "int8-row", 1, FP8_SENC_F32,
+        "ue8m0 family [129,33000], stamped int8-row -> fmt=1"));
+    CHECK(expect_fmt_senc(129,33000, (int64_t)129*33000, 516, "fp8-e4m3-b128", 8, FP8_SENC_UE8M0,
+        "ue8m0 family [129,33000], stamped fp8-e4m3-b128 -> fmt=8, senc=ue8m0"));
 }
 
 /* ---- Part B: qt_from_disk loader-seam (real safetensors file) ---- */
@@ -528,6 +563,79 @@ static void test_loader_seam(void){
     QT tr1={.fmt=1,.q8=q1,.s=s1,.O=O1,.I=I1};
     deq_fmt1(&tr1,dq_ref1);
     CHECK(memcmp(dq_load1,dq_ref1,sizeof dq_ref1)==0);
+
+    unlink(path); rmdir(dir);
+}
+
+/* ---- Part B2: qt_from_disk loader seam for a UE8M0-scaled container ----
+ * The end-to-end property the whole design rests on: a sidecar declared
+ * dtype F8_E8M0 (1 byte/block) is READ raw and EXPANDED to f32 exactly once,
+ * so that after qt_from_disk returns, a ue8m0 tensor is indistinguishable
+ * from an f32-scaled one -- t->s is f32, and every downstream consumer
+ * (matmul_fp8, qt_bytes, the Metal branch) works unmodified. t->senc records
+ * the provenance and nothing reads it to change behaviour.
+ *
+ * Note this ALSO covers st.h's F8_E8M0 dtype mapping: without it, st_init
+ * would exit(1) on "unsupported dtype" before the loader ever ran. */
+static void test_loader_seam_ue8m0(void){
+    enum { O8=8, I8=256 };                        /* nblkO=1, nblkI=2 -> 2 blocks.
+                                                   * ns=2 collides with nothing here:
+                                                   * fmt=1 per-row would be O*4=32,
+                                                   * f32 block scales would be 8. */
+    enum { NBLK8 = CDIV(O8,128) * CDIV(I8,128) };
+    static uint8_t q8b[O8*I8];
+    /* Exponents spanning below/above the bias so a sign-flipped or unbiased
+     * decode (2^e, or 2^(127-e)) cannot pass: 120 -> 2^-7, 134 -> 2^7. */
+    static uint8_t se[NBLK8] = { 120, 134 };
+    for(int i=0;i<O8*I8;i++) q8b[i]=rndbyte_nonan();
+
+    const char *dir="tests/tmp_ue8m0_snap";
+#ifdef _WIN32
+    mkdir(dir);
+#else
+    mkdir(dir,0755);
+#endif
+    char path[300]; snprintf(path,sizeof path,"%s/model.safetensors",dir);
+    int64_t nb8=(int64_t)O8*I8, ns8=(int64_t)NBLK8;   /* ONE byte per block, not four */
+    char hdr[512];
+    int hl=snprintf(hdr,sizeof hdr,
+        "{\"w8\":{\"dtype\":\"U8\",\"shape\":[%lld],\"data_offsets\":[0,%lld]},"
+        "\"w8.qs\":{\"dtype\":\"F8_E8M0\",\"shape\":[%lld],\"data_offsets\":[%lld,%lld]}}",
+        (long long)nb8,(long long)nb8,
+        (long long)ns8,(long long)nb8,(long long)(nb8+ns8));
+    FILE *f=fopen(path,"wb");
+    if(!f){ printf("FAIL: cannot create %s (run from c/, like tools/run_tests.py does)\n", path); fails++; return; }
+    uint64_t hlen=(uint64_t)hl;
+    fwrite(&hlen,8,1,f); fwrite(hdr,1,hl,f);
+    fwrite(q8b,1,(size_t)nb8,f); fwrite(se,1,(size_t)ns8,f);
+    fclose(f);
+
+    static Model gm2; st_init(&gm2.S, dir);
+    QT t8; memset(&t8,0,sizeof t8);
+    qt_from_disk(&gm2,"w8",O8,I8,8,0,&t8);
+    CHECK(t8.fmt==8);
+    CHECK(t8.senc==FP8_SENC_UE8M0);              /* provenance recorded */
+    CHECK(t8.q8!=NULL && t8.s!=NULL);
+    /* The scales are f32 IN MEMORY and hold the decoded powers of two. */
+    for(int b=0;b<NBLK8;b++) CHECK(t8.s[b]==ue8m0_decode(se[b]));
+    CHECK(t8.s[0]==(float)ldexp(1.0,-7));
+    CHECK(t8.s[1]==(float)ldexp(1.0, 7));
+    /* Full dequant equals a reference built from the SAME weight bytes with
+     * the expanded scales handed in directly -- i.e. the load path introduced
+     * no reordering and no rounding. */
+    static float dq_load8[O8*I8], dq_ref8[O8*I8];
+    static float sref[NBLK8];
+    fp8_ue8m0_expand(sref, se, NBLK8);
+    deq_fmt8(&t8,dq_load8);
+    QT tr8={.fmt=8,.q8=(int8_t*)q8b,.s=sref,.O=O8,.I=I8};
+    deq_fmt8(&tr8,dq_ref8);
+    CHECK(memcmp(dq_load8,dq_ref8,sizeof dq_ref8)==0);
+    /* Resident byte accounting is the f32 count: qt_bytes/qt_scale_bytes
+     * describe what is IN RAM, and the expansion happened at load. Pinned so
+     * nobody "fixes" these to the 1-byte on-disk count and breaks the
+     * AUTOPIN/RAM budget or qt_wire_split's mlock ranges. */
+    CHECK(qt_scale_bytes(&t8)==(int64_t)NBLK8*4);
+    CHECK(qt_bytes(&t8)==nb8+(int64_t)NBLK8*4);
 
     unlink(path); rmdir(dir);
 }
@@ -785,7 +893,8 @@ static int resolved_fmt_probe(int O, int I, int64_t nb, int64_t ns, const char *
         if(devnull>=0) dup2(devnull,2);                 /* silence refusal chatter */
         close(pipefd[0]);
         int gs=0;
-        int fmt = qt_resolve_fmt("sweep", O, I, nb, ns, &gs, stamped);
+        int senc=-1;
+        int fmt = qt_resolve_fmt("sweep", O, I, nb, ns, &gs, stamped, &senc);
         unsigned char b = (unsigned char)fmt;
         ssize_t wr = write(pipefd[1], &b, 1); (void)wr;
         _exit(0);
@@ -1189,9 +1298,10 @@ static void test_stamp_map_cap_exceeded(void){
 int main(void){
     test_disambiguation();
     test_fmt6_fp8_collision();
-    test_ue8m0_scale_refusal();
+    test_ue8m0_scale_decode();
     test_ue8m0_family_sweep();
     test_loader_seam();
+    test_loader_seam_ue8m0();
     check_fp8_bytes(2048,6144, "qt_bytes fmt=8 gate/up-shaped O=2048 I=6144 (spec example)");
     check_fp8_bytes(6144,2048, "qt_bytes fmt=8 down-shaped O=6144 I=2048");
     check_fp8_bytes(130,200,   "qt_bytes fmt=8 block edges O,I both non-mult-128");

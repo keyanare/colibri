@@ -64,7 +64,7 @@ the bytes alone say.
 | 5 | `int3-g64` | `O*ceil(I/64)*24` bytes (`q4`; 24B/group = 16B low-plane + 8B high-plane, `I3_GROUP=64`/`I3_GBYTES=24`) | 1 `f32` per **64-input group**, `O*ceil(I/64)` entries | stable, upstream | `5e42e70` |
 | 6 | `e8-iq3-lattice` (E8/IQ3 lattice) | `O*ceil(I/256)*98` bytes (98-byte self-contained super-blocks: E8 lattice indices + parity signs + fp16 super-scales; `E8_QK=256`, `E8_BBYTES=98`) | none as a separate array — scales live **inside** the super-blocks; the `.qs` sidecar is a single-float tag (`ns==4` is the loader's discriminator). NOTE: stores `W@Q` (block-diagonal FWHT rotation) — activations must be rotated before the kernel | **stable, upstream** — [#465](https://github.com/JustVugg/colibri/pull/465) MERGED 2026-07-21 | dev `dce7012` |
 | 7 | `mxfp4` (no in-tree name string — dev has no stamp feature) | `O*ceil(I/2)` bytes (e2m1 nibbles, 2 packed values/byte — same nibble packing as fmt=2/4) | in the **container**: 1 **UE8M0** byte (u8 power-of-two exponent) per **group** of `gs=32` inputs; expanded to 1 `f32` per group at Vulkan upload (`c/kimi_k3.c`'s `mx4_scale` loop — the shader is float-only). Host gate: `gs >= 8 && gs % 8 == 0` (`c/backend_vulkan.c`) | **stable, upstream** — Kimi K3 native routed-expert tier, **Vulkan backend only** (`c/backend_vulkan.c`, `c/shaders/qmatmul.comp`); NOT a CPU/`QT` format — `qt_resolve_fmt` never returns 7 and the Metal backend refuses it | merged [#676](https://github.com/JustVugg/colibri/issues/676)/[#705](https://github.com/JustVugg/colibri/pull/705) |
-| **8** | `fp8-e4m3-b128` | `O*I` × 1 byte (`q8`, raw e4m3, byte-identical layout to fmt=1) | a **declared property**, not one fixed layout — see "Scale encoding is a declared property" below. **f32** (1 per 128×128 block, `ceil(O/128)*ceil(I/128)` entries) is IMPLEMENTED; **UE8M0** (1 byte/block, same block grid) is RECOGNIZED and refused by name, not yet implemented | **this PR pair** — CPU/Metal/repack/collision-refusal on `fmt7/fp8-passthrough`, this stamp+registry PR stacked on top; developed under the PRIVATE ORDINAL BLOCK as `fmt=100`; assigned fmt=7 by the maintainer on #524, renumbered to **fmt=8** after #705 merged claiming 7 for MXFP4 while this pair was open (see "ID assignment" below) | `fmt7/fp8-passthrough` (PR 1) |
+| **8** | `fp8-e4m3-b128` | `O*I` × 1 byte (`q8`, raw e4m3, byte-identical layout to fmt=1) | a **declared property**, not one fixed layout — see "Scale encoding is a declared property" below. BOTH are implemented on the read path: **f32** (1 per 128×128 block, `ceil(O/128)*ceil(I/128)` entries) and **UE8M0** (1 byte/block, same block grid, dtype `F8_E8M0`, expanded to f32 at load). The writer emits f32 only | **this PR pair** — CPU/Metal/repack/collision-refusal on `fmt7/fp8-passthrough`, this stamp+registry PR stacked on top; developed under the PRIVATE ORDINAL BLOCK as `fmt=100`; assigned fmt=7 by the maintainer on #524, renumbered to **fmt=8** after #705 merged claiming 7 for MXFP4 while this pair was open (see "ID assignment" below) | `fmt7/fp8-passthrough` (PR 1) |
 
 With fmt 0–8 all assigned, the next free public ordinal is **9** — per the
 convention below it isn't claimed here; an ID is only settled at merge.
@@ -145,25 +145,44 @@ scale array:
 - **UE8M0** — 1 byte/block, a power-of-two exponent (dtype `F8_E8M0`), same
   `ceil(O/128)*ceil(I/128)` block grid. **DeepSeek-V4 ships this identical
   weight geometry (FP8 E4M3, 128×128 blocks) with UE8M0 scales instead of
-  f32** — a finding the maintainer surfaced on #524. This PR pair
-  **recognizes but does not implement** it: `qt_resolve_fmt` detects the
-  distinct byte signature (`ns == ceil(O/128)*ceil(I/128)`, exactly 1/4 the
-  f32 byte count, never coincidentally equal to it for any `O,I >= 1`) and
-  refuses by name — *"fp8-e4m3-b128 with ue8m0 scales recognized but not
-  implemented; only f32 block scales are supported in this build"* — rather
-  than misreading the sidecar as truncated or corrupt f32 data. A future
-  UE8M0 decoder (CPU kernel + Metal kernel + this resolver's `fmt==1`
-  candidate branch) lands into this seam; it is explicitly invited follow-up
-  work, not blocked on anything in this PR pair. The MXFP4 routed-expert
-  question (E2M1 + ue8m0 g32) raised alongside this finding is a **separate**
-  format and a separate conversation — but this same scale-encoding-as-
-  property mechanism is designed to serve it too.
+  f32** — a finding the maintainer surfaced on #524, since confirmed by the
+  published checkpoint, whose `config.json` declares
+  `quantization_config = {"quant_method": "fp8", "fmt": "e4m3",
+  "scale_fmt": "ue8m0", "weight_block_size": [128,128]}`. **IMPLEMENTED**
+  (read path): `qt_resolve_fmt` detects the distinct byte signature
+  (`ns == ceil(O/128)*ceil(I/128)`, exactly 1/4 the f32 byte count, never
+  coincidentally equal to it for any `O,I >= 1`), resolves it to fmt=8 with
+  `senc = FP8_SENC_UE8M0`, and `qt_from_disk` expands the sidecar to the
+  f32 block-scale array via `ue8m0_decode` (`scale = 2^(e-127)`, `0xFF` =
+  NaN per OCP E8M0).
+
+  The expansion happens **once, at load**, and is lossless — every decodable
+  exponent is exactly representable in float32 (`e=0` → `2^-127` is
+  subnormal but exact; `e=254` → `2^127` is the largest, still finite). That
+  is the design point: after `qt_from_disk` returns, a UE8M0 tensor is
+  indistinguishable from an f32-scaled one, so `matmul_fp8`, the Metal
+  `mm_gemv` fmt=8 branch, `qt_bytes`/`qt_scale_bytes` and `qt_wire_split`
+  are **unchanged** and keep the coverage they already had. No kernel gained
+  a second scale path, and no new ordinal was minted — the encoding is
+  recorded in `QT.senc` as provenance and nothing branches on it.
+
+  Writing UE8M0 is deliberately **not** offered: `repack_fp8_passthrough.py`
+  still emits f32 block scales exclusively. Reading is what a third-party
+  (DeepSeek-V4) container requires; emitting a second encoding from our own
+  tooling would create containers only newer builds can read, for no gain.
+
+  The MXFP4 routed-expert question (E2M1 + ue8m0 g32) raised alongside this
+  finding is a **separate** format and a separate conversation — but this
+  same scale-encoding-as-property mechanism now has a worked precedent for
+  it. (Note fmt=7 already expands per-32-group UE8M0 the same way at Vulkan
+  upload; the two decodes agree on `2^(e-127)`.)
 - A metadata stamp naming `"fp8-e4m3-b128"` (below) confirms the WEIGHT
-  format only. It cannot grant this build a decoder it doesn't have: a
-  tensor whose scale sidecar is UE8M0-shaped still refuses even when
-  correctly stamped, in both places `qt_resolve_fmt` could otherwise resolve
-  an ambiguity (the fmt=1 collision and the fmt=6 collision) — see
-  `qt_resolve_fmt`'s own comments for the exact cases.
+  format only — and that is now sufficient, because **both** of that
+  geometry's scale encodings are decodable. The stamp never has to name the
+  encoding: the two are mutually exclusive at any given shape (the f32
+  candidate needs a different `ns` than the UE8M0 one), so the sidecar's byte
+  count settles it. This is why no second registry NAME was minted, and why a
+  container stamped by an older tool stays readable.
 
 Collision-checked against every other format's `ns` (scale-byte) arithmetic
 reachable from fmt=8's `nb==O*I` weight-byte branch: realistically distinct
@@ -396,6 +415,12 @@ assignment at all.
   assignment" above).
 - ~~Should scale encoding be a hardcoded constant or a declared,
   per-container property?~~ Decided by the maintainer on #524, prompted by
-  the DeepSeek-V4 datapoint above: it's a declared property. f32 is this PR
-  pair's implemented value; UE8M0 is recognized and refused by name, an
-  invited follow-up rather than a blocking requirement.
+  the DeepSeek-V4 datapoint above: it's a declared property. Both values are
+  now implemented on the read path (f32 originally; UE8M0 landed into the
+  seam the recognize-and-refuse-by-name path was holding open, once the
+  published DeepSeek-V4 `config.json` confirmed the encoding).
+- Should the **writer** ever emit UE8M0? Currently no — the read path is what
+  third-party containers need, and a second emitted encoding would produce
+  containers older builds cannot read. Worth revisiting only if a measured
+  case appears where the 4× smaller scale sidecar matters (it is a few tens
+  of KB per tensor).

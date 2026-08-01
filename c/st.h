@@ -78,6 +78,12 @@ static int st_dtype_code(const char *s) {
     if (!strcmp(s, "F32"))  return 2;
     if (!strcmp(s, "U8"))   return 3;   /* dati quantizzati (int4 packed / int8) */
     if (!strcmp(s, "I8"))   return 3;
+    /* F8_E8M0: the ue8m0 block-scale sidecar dtype (DeepSeek-V4's fp8-e4m3-b128
+     * checkpoints declare their scale arrays this way). One byte per element and
+     * opaque to this layer -- the exponent is decoded downstream by
+     * quant.h's ue8m0_decode -- so it belongs to the same raw-byte class as
+     * U8/I8 and is read by byte count, never by st_read_f32's element loop. */
+    if (!strcmp(s, "F8_E8M0")) return 3;
     fprintf(stderr, "unsupported dtype: %s\n", s); exit(1);
 }
 

@@ -151,8 +151,72 @@ static void test_nan_propagation(void){
     CHECK(isnan(y[1]));                        /* contaminated row propagates NaN */
 }
 
+/* ---- UE8M0 block-scale encoding (quant.h's ue8m0_decode / fp8_ue8m0_expand).
+ * The second scale ENCODING fmt=8's weight geometry ships with (DeepSeek-V4's
+ * checkpoints declare scale_fmt="ue8m0"); see quant.h's FP8_SENC_* comment.
+ * The decode is expected to be EXACT for every non-NaN code, which is what
+ * licenses expanding a sidecar to f32 once at load instead of teaching every
+ * kernel a second scale path -- so this asserts bit equality against ldexp in
+ * double precision, not a tolerance. */
+static void test_ue8m0(void){
+    int nan_codes=0;
+    for(int e=0;e<256;e++){
+        float got = ue8m0_decode((uint8_t)e);
+        if(e==0xFF){                       /* the single reserved code: no mantissa bits
+                                            * means E8M0 has no infinity encoding */
+            CHECK(isnan(got)); nan_codes++; continue;
+        }
+        /* Independent reference: build 2^(e-127) in DOUBLE (which represents
+         * every one of these exponents as a normal, so the reference itself
+         * can never be the thing that rounds), then compare after the single
+         * narrowing to float. Exact equality, no tolerance. */
+        double ref = ldexp(1.0, e - 127);
+        CHECK(got == (float)ref);
+        CHECK(got > 0.0f);                 /* unsigned format: never negative, never zero */
+        CHECK(!isinf(got));                /* 2^127 is the largest, still finite in f32 */
+    }
+    CHECK(nan_codes==1);
+    /* e=0 -> 2^-127 is SUBNORMAL in float32 but exactly representable
+     * (2^-127 == 2^22 * 2^-149). Pinned explicitly: a decoder that clamped to
+     * the smallest NORMAL (2^-126) would still pass a tolerance-based check
+     * on every other code. */
+    CHECK(ue8m0_decode(0) == (float)ldexp(1.0, -127));
+    CHECK(ue8m0_decode(127) == 1.0f);      /* the bias itself */
+    CHECK(ue8m0_decode(128) == 2.0f);
+    CHECK(ue8m0_decode(126) == 0.5f);
+    CHECK(ue8m0_decode(254) == (float)ldexp(1.0, 127));   /* largest finite */
+
+    /* fp8_ue8m0_expand is the load-time bridge: same values, block order
+     * preserved. A transposed/reversed expansion would still produce the
+     * right SET of scales, so the assertion is per-index. */
+    uint8_t raw[7] = {0, 1, 126, 127, 128, 254, 255};
+    float out[7];
+    fp8_ue8m0_expand(out, raw, 7);
+    for(int i=0;i<7;i++){
+        if(raw[i]==0xFF) CHECK(isnan(out[i]));
+        else             CHECK(out[i] == ue8m0_decode(raw[i]));
+    }
+
+    /* End to end: a ue8m0 sidecar expanded to f32 and fed to the UNCHANGED
+     * matmul_fp8 must equal what the same block scales produce when handed in
+     * as f32 directly -- the property that let every downstream consumer stay
+     * untouched. Exact equality: same kernel, same inputs, same order. */
+    enum { O=130, I=200 };                 /* nblkO=2, nblkI=2 -> 4 blocks, block edges */
+    static uint8_t q8[O*I]; static uint8_t se[4]; static float sf[4], y_e[O], y_f[O];
+    static float x[I];
+    for(int i=0;i<O*I;i++) q8[i]=rndbyte_nonan();
+    for(int i=0;i<I;i++) x[i]=rndf();
+    se[0]=120; se[1]=127; se[2]=133; se[3]=110;
+    fp8_ue8m0_expand(sf, se, 4);
+    matmul_fp8(y_e, x, q8, sf, 1, I, O);
+    float sf2[4]; for(int i=0;i<4;i++) sf2[i]=(float)ldexp(1.0, (int)se[i]-127);
+    matmul_fp8(y_f, x, q8, sf2, 1, I, O);
+    for(int o=0;o<O;o++) CHECK(y_e[o]==y_f[o]);
+}
+
 int main(void){
     test_lut();
+    test_ue8m0();
     run_block_case(2048, 6144, "block gate/up-shaped O=2048 I=6144 (spec example)");
     run_block_case(6144, 2048, "block down-shaped O=6144 I=2048");
     run_block_case(130, 200,   "block edges: O,I both non-mult-128");
