@@ -513,6 +513,12 @@ tests/test_tok_dsv4$(EXE): tests/test_tok_dsv4.c tok.h tok_unicode.h tok_unicode
 tests/test_tier$(EXE): tests/test_tier.c tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_dsv4$(EXE): tests/test_dsv4.c dsv4.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_dsv4_model$(EXE): tests/test_dsv4_model.c dsv4_model.h dsv4.h json.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
