@@ -1042,7 +1042,7 @@ int main(int argc, char **argv){
     if(g_expert_gb<=0.0f) g_expert_gb=0.25f;
     if(g_max_seq<64) g_max_seq=64;
 #ifdef _OPENMP
-    omp_tune_threads();
+    coli_omp_tune_threads("deepseek_v4");   /* physical-core team, no spin-wait — see omp_tune.h */
 #endif
 
     fprintf(stderr,"  deepseek_v4 — 284B MoE, 13B active (UNVERIFIED build)\n");
