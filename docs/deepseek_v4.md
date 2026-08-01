@@ -62,6 +62,7 @@ c/deepseek_v4.c                 the engine
 c/tok_unicode_dsv4.h            generated \p{P} \p{S} \p{M} tables
 c/tools/make_tiny_dsv4.py       synthetic checkpoint + numpy oracle
 c/tools/dsv4_tokenizer.py       vocabulary validator + HF cross-check
+c/tools/dsv4_doctor.py          hardware readiness check
 c/tools/gen_unicode_dsv4.py     regenerates tok_unicode_dsv4.h
 c/tests/test_dsv4.c             17 primitive tests
 c/tests/test_dsv4_model.c       manifest / shape tests
@@ -77,6 +78,19 @@ pre-tokenizer family plus support for string-form `merges`.
 ---
 
 ## Running it
+
+### 0. Check the machine first
+
+```bash
+python3 c/tools/dsv4_doctor.py                     # before downloading 149 GiB
+python3 c/tools/dsv4_doctor.py --bench             # measure the disk too
+python3 c/tools/dsv4_doctor.py --model /nvme/dsv4  # and validate the checkpoint
+```
+
+Sizes the model from its own config, checks disk, RAM, SIMD and OpenMP against
+it, and estimates s/token from what it measured rather than from a table. Exit
+0 means it can run; only real blockers fail, a machine that will merely be slow
+still passes.
 
 ### 1. Build
 
@@ -126,6 +140,8 @@ python3 c/tools/dsv4_tokenizer.py /nvme/dsv4 --ctest c/tests/test_tok_dsv4
 | `--temp T` | 0 = greedy (default) |
 | `--ids` | treat the prompt as comma-separated token ids; skips the tokenizer |
 | `--dump-logits F` | write per-step logits — the oracle path |
+
+`dsv4_doctor.py` suggests an `--expert-gb` that fits your RAM.
 
 ---
 
@@ -214,4 +230,4 @@ Three real defects were caught this way, which is the argument for the harness:
 ---
 
 *Engine and tooling are unmerged work in progress. PRs in this repository go
-against `dev`, not `main` — see [CONTRIBUTING.md](CONTRIBUTING.md).*
+against `dev`, not `main` — see [CONTRIBUTING.md](../CONTRIBUTING.md).*
