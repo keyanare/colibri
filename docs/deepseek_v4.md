@@ -77,6 +77,27 @@ pre-tokenizer family plus support for string-form `merges`.
 
 ---
 
+## Which checkpoint
+
+Two exist, and they are not interchangeable byte-for-byte:
+
+| | `DeepSeek-V4-Flash` (preview) | `DeepSeek-V4-Flash-0731` |
+|---|---|---|
+| shards / size | 46 / ~159.6 GB | 48 / ~166.9 GB |
+| speculative head | one MTP layer | three DSpark modules, `mtp.0/1/2` |
+| `compress_ratios` | 44 entries | **46** entries |
+| `num_nextn_predict_layers` | 1 | still 1 — it does *not* track the module count |
+
+The main stack — the 43 layers this engine actually builds — is the same shape
+in both, and the extra `compress_ratios` entries are trailing. The engine sizes
+the head from `dspark_target_layer_ids` when that key is present and from
+`num_nextn_predict_layers` when it is not, and refuses a length no key in the
+config accounts for rather than assuming the difference is padding. Either way
+the head is not loaded; preflight reports its tensors as expected-unknown.
+
+The tables below were measured against the preview; -0731 adds ~7 GB of
+speculative weights that are never read.
+
 ## Running it
 
 ### 0. Check the machine first
@@ -105,7 +126,7 @@ On macOS: `brew install libomp` first, or the build warns and stays serial.
 ### 2. Tokenizer
 
 **The published checkpoint ships no vocabulary.** Its root has `config.json`,
-`generation_config.json` and 46 shards; `encoding/` is the chat-message layer
+`generation_config.json` and the shards; `encoding/` is the chat-message layer
 (`encode_messages`), not a vocab; `inference/generate.py` calls
 `AutoTokenizer.from_pretrained(ckpt_path)`, which cannot succeed against the
 repository as published. Supply one yourself:
@@ -202,10 +223,10 @@ Three real defects were caught this way, which is the argument for the harness:
 
 ## Known gaps
 
-- **MTP.** `num_nextn_predict_layers: 1`, and `compress_ratios` carries a 44th
-  entry for it — the MTP layer is real and present in the checkpoint. Its tensor
-  names are unknown (the reference inference code does not build it), so the head
-  is not loaded and speculation is off.
+- **The speculative head.** Real and present in the checkpoint, not loaded: its
+  tensor names are unknown (the reference inference code does not build it), so
+  speculation is off. The two releases size it differently and `compress_ratios`
+  is where you see that — see *Which checkpoint* above.
 - **No GPU backend.**
 - **Prefill is serial.** Batching the prompt needs no design change.
 - **The indexer skips** the reference's Hadamard rotation and FP4 QAT
@@ -217,8 +238,6 @@ Three real defects were caught this way, which is the argument for the harness:
 - **The compressor prefill path** is approximated by running the incremental
   decode branch per token, rather than the reference's bulk `start_pos == 0`
   branch with its remainder handling.
-- **No `--preflight`.** `dsv4_manifest` can validate a checkpoint's names and
-  shapes without reading 160 GB, but nothing exposes it on the command line yet.
 
 ## Next, in order of value
 

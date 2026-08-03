@@ -24,9 +24,10 @@
  *     refuses at startup with an explicit message rather than inventing a
  *     vocabulary. A generator in the shape of tools/k3_tokenizer.py is the
  *     missing piece.
- *   - MTP. num_nextn_predict_layers=1 and compress_ratios carries a 44th
- *     entry for it, but the reference does not build it and its tensor names
- *     are unknown, so the head is not loaded and speculation is off.
+ *   - SPECULATIVE HEAD. compress_ratios carries trailing entries for it: one
+ *     on the preview (num_nextn_predict_layers=1), three on -0731 (DSpark,
+ *     mtp.0/1/2). The reference does not build it and its tensor names are
+ *     unknown, so the head is not loaded and speculation is off.
  *   - PREFILL is a loop over single tokens. Correct, and slow; batching the
  *     prompt is the first optimization and needs no design change.
  *   - Batch size is 1 throughout, like every other engine in this repo.
@@ -885,10 +886,11 @@ static int sample(Model *m){
  * loader precisely when it mattered.
  *
  * UNMATCHED CONTAINER TENSORS ARE NOT ERRORS. The manifest covers the main
- * stack only: the MTP head is real (num_nextn_predict_layers=1, and
- * compress_ratios carries a 44th entry for it) but its names are unknown, so
- * anything left over is reported as expected-unknown. Treating it as corruption
- * would make a correct checkpoint look broken. */
+ * stack only: the speculative head is real (one MTP layer on the preview,
+ * three DSpark modules on -0731, each with a trailing compress_ratios entry)
+ * but its names are unknown, so anything left over is reported as
+ * expected-unknown. Treating it as corruption would make a correct checkpoint
+ * look broken. */
 static int64_t pf_expect_weight(const DSV4Tensor *t){
     int64_t O=t->d0, I=t->d1?t->d1:1;
     switch(t->role){
@@ -915,6 +917,9 @@ static int preflight(const char *dir){
     if(!root || dsv4_cfg_from_json(root,&c)!=0){ fprintf(stderr,"  FAIL  config.json rejected\n"); return 1; }
     fprintf(stderr,"  config: %d layers, dim %d, %d experts/layer, top-%d, vocab %d\n",
             c.n_layers,c.dim,c.n_routed_experts,c.n_activated_experts,c.vocab_size);
+    if(c.n_spec)
+        fprintf(stderr,"  config: %d speculative module(s) after the main stack — not loaded\n",
+                c.n_spec);
 
     static shards S; memset(&S,0,sizeof S);
     st_init(&S,dir);
@@ -992,8 +997,9 @@ static int preflight(const char *dir){
         int e=0;
         for(int i=0;i<S.n && e<6;i++) if(!seen[i]){ fprintf(stderr,"    %s\n",S.t[i].name); e++; }
         if(extra>6) fprintf(stderr,"    ... and %d more\n",extra-6);
-        fprintf(stderr,"  (the MTP head is the known case: it exists in the checkpoint,\n"
-                       "   the reference does not build it, so its names are unknown here)\n");
+        fprintf(stderr,"  (the speculative head is the known case: %d module(s) exist in this\n"
+                       "   checkpoint, the reference does not build them, so their names are\n"
+                       "   unknown here)\n", c.n_spec);
     }
 
     char tp[2100]; snprintf(tp,sizeof tp,"%s/tokenizer.json",dir);

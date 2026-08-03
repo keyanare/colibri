@@ -75,6 +75,7 @@ static void test_cfg_parse(void){
     /* 44 entries for 43 layers: the trailing one is the MTP head's. */
     CHECK(CFG.n_nextn==1);
     CHECK(CFG.n_compress_ratios==CFG.n_layers+CFG.n_nextn);
+    CHECK(CFG.n_spec==1);
     /* Two RoPE bases, and YaRN parameters read from the nested object -- a
      * flat lookup would silently give the defaults here. */
     CHECK(CFG.rope_theta==10000.f);
@@ -132,6 +133,49 @@ static void test_cfg_refuses_mismatch(void){
     char *a2=NULL; jval *r2=json_parse(buf2,&a2);
     DSV4Cfg bad2;
     CHECK(dsv4_cfg_from_json(r2,&bad2)==-1);
+}
+
+/* The -0731 (DSpark) checkpoint appends THREE speculative modules -- mtp.0/1/2,
+ * one per dspark_target_layer_ids entry -- while leaving
+ * num_nextn_predict_layers at the preview's 1. So 46 entries for 43 layers is
+ * correct there, and the n_layers+n_nextn rule alone refuses a good checkpoint.
+ * What must stay refused is the same 46 entries with nothing in the config that
+ * accounts for them: the length is only ever unlocked by a key that states it.
+ *
+ * Everything below the head is the main stack, unchanged between the two
+ * releases; only the tail differs. */
+static const char *CFG46_HEAD =
+"{\"hidden_size\":4096,\"num_hidden_layers\":43,\"num_attention_heads\":64,"
+"\"head_dim\":512,\"qk_rope_head_dim\":64,\"q_lora_rank\":1024,\"o_lora_rank\":1024,"
+"\"o_groups\":8,\"n_routed_experts\":256,\"num_experts_per_tok\":6,"
+"\"moe_intermediate_size\":2048,\"n_shared_experts\":1,\"vocab_size\":129280,"
+"\"num_hash_layers\":3,\"index_n_heads\":64,\"index_head_dim\":128,\"index_topk\":512,"
+"\"hc_mult\":4,\"hc_sinkhorn_iters\":20,\"sliding_window\":128,"
+"\"num_nextn_predict_layers\":1,"
+"\"compress_ratios\":[0,0,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,"
+"4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,128,4,0,0,0]";
+
+static void test_cfg_accepts_dspark_head(void){
+    char b[2048];
+    snprintf(b,sizeof b,"%s,\"dspark_target_layer_ids\":[40,41,42],"
+                        "\"dspark_block_size\":5,\"dspark_markov_rank\":256}",CFG46_HEAD);
+    char *buf=strdup(b); char *a=NULL; jval *r=json_parse(buf,&a);
+    DSV4Cfg c;
+    CHECK(dsv4_cfg_from_json(r,&c)==0);
+    CHECK(c.n_layers==43);
+    CHECK(c.n_compress_ratios==46);
+    CHECK(c.n_nextn==1);
+    CHECK(c.n_spec==3);                 /* from dspark_target_layer_ids, not n_nextn */
+    /* The point of the whole exercise: the extra entries must not shift the
+     * main stack. Layer 42 is a ratio-4 (CSA) layer in both releases. */
+    CHECK(c.compress_ratios[42]==4);
+
+    /* Same 46 entries, no key that accounts for them -> still a refusal. */
+    char b2[2048];
+    snprintf(b2,sizeof b2,"%s}",CFG46_HEAD);
+    char *buf2=strdup(b2); char *a2=NULL; jval *r2=json_parse(buf2,&a2);
+    DSV4Cfg c2;
+    CHECK(dsv4_cfg_from_json(r2,&c2)==-1);
 }
 
 static DSV4Tensor *MAN; static int NMAN;
@@ -332,6 +376,7 @@ int main(void){
     if(fails){ printf("dsv4 model tests: %d FAILED (config)\n",fails); return 1; }
     test_cfg_refuses_mismatch();
     test_cfg_refuses_unknown_ratio();
+    test_cfg_accepts_dspark_head();
     test_manifest_count_matches();
     if(!MAN){ printf("dsv4 model tests: manifest alloc failed\n"); return 1; }
     test_layer_classes();

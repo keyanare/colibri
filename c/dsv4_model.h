@@ -49,8 +49,12 @@ typedef struct {
     int window_size, original_seq_len, max_seq_len;
     int norm_topk;      /* norm_topk_prob: renormalize the selected expert
                          * weights to sum 1 before route_scale */
-    int n_nextn;        /* num_nextn_predict_layers: MTP heads appended after the
-                         * main stack. See the compress_ratios note below. */
+    int n_nextn;        /* num_nextn_predict_layers, as published */
+    int n_spec;         /* speculative-decoding modules appended after the main
+                         * stack = how many trailing compress_ratios entries are
+                         * NOT main-stack layers. Derived, because the two
+                         * published checkpoints disagree with each other about
+                         * which key states it -- see the note below. */
     float hc_eps, norm_eps, route_scale, swiglu_limit;
     float rope_theta, compress_rope_theta, rope_factor, beta_fast, beta_slow;
     int compress_ratios[DSV4_MAX_LAYERS];
@@ -133,6 +137,13 @@ static int dsv4_cfg_from_json(jval *r, DSV4Cfg *c){
       if(cr->len>DSV4_MAX_LAYERS){ fprintf(stderr,"config: compress_ratios has %d entries, max %d\n",cr->len,DSV4_MAX_LAYERS); return -1; }
       c->n_compress_ratios=cr->len;
       for(int i=0;i<cr->len;i++) c->compress_ratios[i]=(int)cr->kids[i]->num; }
+    /* DSpark (the -0731 release) states its speculative-module count only by
+     * the length of dspark_target_layer_ids -- one module per fused layer,
+     * mtp.0..mtp.N-1 -- while leaving num_nextn_predict_layers at the preview's
+     * 1. Neither key alone explains that checkpoint's trailing entries. */
+    int n_dspark=0;
+    { jval *dt=json_get(r,"dspark_target_layer_ids");
+      if(dt&&dt->t==J_ARR) n_dspark=dt->len; }
 
     #define REQ(field,name,lo,hi) if(c->field<(lo)||c->field>(hi)){ \
         fprintf(stderr,"config: %s=%d outside [%d,%d]\n",name,(int)c->field,(int)(lo),(int)(hi)); return -1; }
@@ -149,17 +160,28 @@ static int dsv4_cfg_from_json(jval *r, DSV4Cfg *c){
     REQ(hc_mult,"hc_mult",1,DSV4_HC_MAX)           REQ(hc_sinkhorn_iters,"hc_sinkhorn_iters",1,1024)
     REQ(window_size,"sliding_window",1,1<<20)
     #undef REQ
-    /* compress_ratios covers the main stack AND the MTP head(s): the published
-     * checkpoint has 44 entries for num_hidden_layers=43 with
-     * num_nextn_predict_layers=1, the trailing entry being the MTP layer's
-     * (ratio 0 -- pure sliding window). Accept either length so a config with
-     * MTP provisioned and one without both load, and refuse anything else
-     * rather than silently indexing past the main stack. */
-    if(c->n_compress_ratios != c->n_layers &&
-       c->n_compress_ratios != c->n_layers + c->n_nextn){
+    /* compress_ratios covers the main stack AND the speculative head(s), and
+     * how many of the latter there are differs between the two published
+     * checkpoints:
+     *   preview      44 entries, num_hidden_layers=43, one MTP layer
+     *   -0731 DSpark 46 entries, num_hidden_layers=43, three modules
+     *                (mtp.0/1/2, one per dspark_target_layer_ids entry) while
+     *                num_nextn_predict_layers still reads 1
+     * Accept exactly the lengths a key in THIS config accounts for -- no head,
+     * n_nextn heads, or n_dspark modules -- and refuse anything else rather
+     * than silently indexing past the main stack. The trailing entries are only
+     * ever read by a head this engine does not build; what they must not do is
+     * shift which ratio a main-stack layer gets. */
+    if(c->n_compress_ratios == c->n_layers)                        c->n_spec=0;
+    else if(c->n_compress_ratios == c->n_layers + c->n_nextn)      c->n_spec=c->n_nextn;
+    else if(n_dspark && c->n_compress_ratios == c->n_layers + n_dspark) c->n_spec=n_dspark;
+    else {
         fprintf(stderr,"config: compress_ratios has %d entries, expected %d "
-                "(num_hidden_layers) or %d (+ num_nextn_predict_layers=%d)\n",
+                "(num_hidden_layers) or %d (+ num_nextn_predict_layers=%d)",
                 c->n_compress_ratios,c->n_layers,c->n_layers+c->n_nextn,c->n_nextn);
+        if(n_dspark) fprintf(stderr," or %d (+ %d dspark_target_layer_ids)",
+                             c->n_layers+n_dspark,n_dspark);
+        fprintf(stderr,"\n");
         return -1; }
     for(int i=0;i<c->n_compress_ratios;i++){
         int rt=c->compress_ratios[i];
@@ -300,15 +322,16 @@ static void dsv4_global_tensors(DSV4List *L, const DSV4Cfg *c){
 /* Fill `out` with the manifest for the MAIN STACK. Returns the count, or -1 if
  * `cap` was too small (the caller sizes with dsv4_manifest_count).
  *
- * DELIBERATE GAP: the MTP head (num_nextn_predict_layers=1, whose compression
- * class is the trailing compress_ratios entry) is NOT emitted. Its tensor
- * NAMES are not known here -- the published reference inference code does not
- * build it, so there is nothing to transcribe -- and inventing names would
- * produce a manifest that fails against the real checkpoint for a reason that
- * looks like a shape bug. A verifier walking this manifest should therefore
- * treat unmatched `layers.43.*` (or `mtp.*`) tensors in a container as
- * EXPECTED-UNKNOWN, not as corruption. Filling this in needs one look at the
- * checkpoint's own tensor index. */
+ * DELIBERATE GAP: the speculative head -- one MTP layer on the preview, three
+ * DSpark modules on -0731, whose compression classes are the trailing
+ * n_spec compress_ratios entries -- is NOT emitted. Its tensor NAMES are not
+ * known here (the published reference inference code does not build it, so
+ * there is nothing to transcribe) and inventing names would produce a manifest
+ * that fails against the real checkpoint for a reason that looks like a shape
+ * bug. A verifier walking this manifest should therefore treat unmatched
+ * `layers.43.*` / `mtp.*` tensors in a container as EXPECTED-UNKNOWN, not as
+ * corruption. Filling this in needs one look at the checkpoint's own tensor
+ * index. */
 static int dsv4_manifest(const DSV4Cfg *c, DSV4Tensor *out, int cap){
     DSV4List L={out,0,cap,0};
     dsv4_global_tensors(&L,c);
