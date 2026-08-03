@@ -375,6 +375,35 @@ static void compressor_init(Model *m, Compressor *C, shards *S, const char *pref
     }
 }
 
+/* ---------------------------------------------------------------- stop ids
+ * The generation loop ran to --ngen regardless of what the model said. That is
+ * invisible on a base-style completion and wrong the moment a chat template is
+ * used: the model closes its turn and then keeps going, inventing the next one.
+ *
+ * TWO SOURCES, because they disagree by design. config.json's eos_token_id is
+ * the pretraining end-of-sequence (1 here); a DeepSeek chat turn ends with
+ * <|EOT|>, which appears only in generation_config.json -- and there the key
+ * may be a LIST. Collect from both and stop on any of them. */
+#define DSV4_MAX_STOP 8
+static int g_stop[DSV4_MAX_STOP], g_nstop;
+
+static void stop_add(int id){
+    if(id<0) return;
+    for(int i=0;i<g_nstop;i++) if(g_stop[i]==id) return;
+    if(g_nstop<DSV4_MAX_STOP) g_stop[g_nstop++]=id;
+}
+static void stop_from(jval *r, const char *key){
+    jval *v=json_get(r,key);
+    if(!v) return;
+    if(v->t==J_NUM) stop_add((int)v->num);
+    else if(v->t==J_ARR)
+        for(int i=0;i<v->len;i++) if(v->kids[i]->t==J_NUM) stop_add((int)v->kids[i]->num);
+}
+static int is_stop(int id){
+    for(int i=0;i<g_nstop;i++) if(g_stop[i]==id) return 1;
+    return 0;
+}
+
 static void model_load(Model *m, const char *dir){
     double t0=now_s();
     st_init(&m->S,dir);
@@ -389,6 +418,22 @@ static void model_load(Model *m, const char *dir){
     size_t got=fread(buf,1,(size_t)n,f); buf[got]=0; fclose(f);
     char *arena=NULL; jval *root=json_parse(buf,&arena);
     if(!root||dsv4_cfg_from_json(root,&m->c)!=0){ fprintf(stderr,"config.json rejected\n"); exit(1); }
+    stop_from(root,"eos_token_id");
+    /* generation_config.json is optional and, where it exists, authoritative
+     * about how a TURN ends rather than how a document ends. */
+    { char gp[2100]; snprintf(gp,sizeof gp,"%s/generation_config.json",dir);
+      FILE *gf=fopen(gp,"rb");
+      if(gf){
+          fseek(gf,0,SEEK_END); long gn=ftell(gf); fseek(gf,0,SEEK_SET);
+          if(gn>0 && gn<(1L<<20)){
+              char *gb=(char*)xalloc((size_t)gn+1,"generation_config");
+              size_t gg=fread(gb,1,(size_t)gn,gf); gb[gg]=0;
+              char *ga=NULL; jval *groot=json_parse(gb,&ga);
+              if(groot) stop_from(groot,"eos_token_id");
+              free(ga); free(gb);
+          }
+          fclose(gf);
+      } }
 
     /* tokenizer: refuse loudly rather than invent a vocabulary. Skipped
      * entirely in --ids mode, which is how the synthetic-fixture oracle drives
@@ -1125,6 +1170,7 @@ int main(int argc, char **argv){
     for(;pos<n_ids-1;pos++){ forward(&m,ids[pos],pos); tok=ids[pos+1]; }
 
     char piece[512];
+    int gen=0, hit_stop=0;
     for(int g=0;g<g_ngen;g++){
         forward(&m,tok,pos++);
         if(dump){
@@ -1135,18 +1181,25 @@ int main(int argc, char **argv){
             dumped++;
         }
         tok=sample(&m);
+        /* --ids is the oracle path: the fixture compares a FIXED number of
+         * steps against numpy, so a stop there would turn a random sample into
+         * a spurious test failure. Text generation is where a user wants it. */
+        if(!g_ids_mode && is_stop(tok)){ hit_stop=1; break; }
         if(m.have_tok){
             int nb=tok_decode(&m.tok,&tok,1,piece,(int)sizeof piece);
             if(nb>0){ fwrite(piece,1,(size_t)nb,stdout); fflush(stdout); }
         } else {
-            printf("%s%d",g?",":"",tok); fflush(stdout);
+            printf("%s%d",gen?",":"",tok); fflush(stdout);
         }
+        gen++;
         if(pos>=g_max_seq-1) break;
     }
     if(dump){ fprintf(dump,"]}\n"); fclose(dump); }
     double dt=now_s()-t0;
-    fprintf(stderr,"\n  %d tokens in %.1fs (%.2f tok/s) | experts: %llu hit / %llu miss, %.1fs loading\n",
-            g_ngen,dt,g_ngen/dt,
+    /* `gen`, not g_ngen: the loop can end early on a stop id or on max-seq, and
+     * reporting the request instead of the result overstates tok/s. */
+    fprintf(stderr,"\n  %d tokens in %.1fs (%.2f tok/s)%s | experts: %llu hit / %llu miss, %.1fs loading\n",
+            gen,dt,dt>0?gen/dt:0.0, hit_stop?" [stopped at eos]":"",
             (unsigned long long)m.expert_hits,(unsigned long long)m.expert_miss,m.expert_load_s);
     free(ids);
     return 0;
