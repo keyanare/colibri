@@ -15,6 +15,7 @@
  * every "ok" below as "matches the published reference implementation as
  * transcribed", not as "matches the model". */
 #include "../dsv4.h"
+#include "../quant.h"      /* matmul_mxfp4 -- the routed-expert kernel (NEON test below) */
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -468,6 +469,50 @@ static void test_index_score_relu_inside(void){
     }
 }
 
+/* ---------------- MXFP4 routed-expert matmul (quant.h matmul_mxfp4) ------- */
+/* On ARM the kernel takes the NEON path for I%32==0 (I=dim / I=moe_inter_dim
+ * for every DSV4 expert); on x86 the AVX2 path. Whatever the SIMD branch, this
+ * pins the byte layout and the e2m1 * 2^(s-127) semantics against an
+ * INDEPENDENT scalar reference written here with the UNDOUBLED e2m1 LUT -- so a
+ * sign-bit flip, a low/high nibble swap, or a doubled-value-without-half-scale
+ * mistake in the SIMD decode each fail here. */
+static void test_mxfp4_neon(void){
+    enum { S=2, I=64, O=5 };
+    static const float true_lut[16]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f,
+                                     -0.f,-.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
+    uint8_t q4[O*I/2], e8[O*I/32]; float x[S*I], y[O*S], ref[O*S];
+    for(int i=0;i<O*I/2;i++) q4[i]=(uint8_t)(rng&0xFF);
+    for(int i=0;i<O*I/32;i++) e8[i]=(uint8_t)(100+rng%28);        /* exact exponent */
+    for(int i=0;i<S*I;i++) x[i]=rndf();
+    matmul_mxfp4(y,x,q4,e8,S,I,O);
+    for(int o=0;o<O;o++) for(int s=0;s<S;s++){
+        float a=0; const float *xs=x+s*I;
+        for(int g=0;g<I/32;g++){
+            float sc; { union{uint32_t u;float f;}b; b.u=(uint32_t)e8[o*I/32+g]<<23; sc=b.f; }
+            float ga=0;
+            for(int c=0;c<32;c++){
+                uint8_t byte=q4[o*I/2+(g*32+c)/2];
+                uint8_t nib=(c&1)?(byte>>4):(byte&0xF);           /* low=even, high=odd */
+                ga+=xs[g*32+c]*true_lut[nib];
+            }
+            a+=ga*sc;
+        }
+        ref[s*O+o]=a;
+    }
+    double num=0,den=0;
+    for(int i=0;i<O*S;i++){ double d=(double)y[i]-ref[i]; num+=d*d; den+=ref[i]*ref[i]; }
+    float rel=(float)(sqrt(num)/(sqrt(den)+1e-30));
+    CHECK(rel<1e-5f);
+    printf("  mxfp4: rel_l2 %.2e (S=%d I=%d O=%d, %s)\n",(double)rel,S,I,O,
+#ifdef __ARM_NEON
+           "NEON");
+#elif defined(__AVX2__)
+           "AVX2");
+#else
+           "scalar");
+#endif
+}
+
 int main(void){
     test_sinkhorn_doubly_stochastic();
     test_sinkhorn_iters_matter();
@@ -486,6 +531,7 @@ int main(void){
     test_sparse_attn_sink_effect();
     test_sparse_attn_all_masked();
     test_index_score_relu_inside();
+    test_mxfp4_neon();
     if(fails){ printf("dsv4 primitive tests: %d FAILED\n",fails); return 1; }
     printf("dsv4 primitive tests: ok\n");
     return 0;

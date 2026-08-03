@@ -226,7 +226,7 @@ whole working set: **6 experts × 43 layers × 13.4 MB ≈ 3.4 GB read per token
 |---|---|---|
 | resident | ~9.7 GB | ~9.7 GB |
 | expert cache | 3–4 GB (~5 experts/layer) | ~20 GB (~35 experts/layer) |
-| expert kernels | **scalar** (no NEON path yet) | AVX2 |
+| expert kernels | NEON (I%32==0) | AVX2 |
 | estimate | ~1.5–3 s/token | **measured: 3.8 s/token prefill, 4.0 s/token decode** (`--expert-gb 3.5`, 197-token prompt) |
 
 They land in the same place for different reasons: the Mac has a faster SSD but
@@ -257,7 +257,7 @@ not free in that sense — it changes reduction order.
 | shapes and tensor wiring | the derived manifest reproduces DeepSeek's own published figures: **284.3B** parameters (published 284B), **13.3B** active (published 13B), **155 GB** on disk (published 160 GB), 97.4% in routed experts. None of those numbers were used to build the manifest. |
 | the whole forward pass | a synthetic checkpoint in the real on-disk format, run through the engine and an independent numpy implementation: **rel-L2 1.0e-05**, argmax identical on every step. `make test-python` (needs numpy). |
 | tokenizer | **356/356** cases match HF `tokenizers` on the real vocabulary — punctuation, contractions, CJK, Korean, Thai, Arabic, Hebrew, Cyrillic, combining marks, ZWJ emoji, CRLF, URLs, code, 200 random strings. Forced down the `cl100k` path the same vocabulary scores **341/356**, which is why the fourth family exists. |
-| primitives | 17 test groups, most of them aimed at a specific way a plausible reimplementation goes wrong (untransposed `comb`, symmetric SwiGLU clamp, sink folded into the loop, per-token instead of per-dimension pooling). |
+| primitives | 18 test groups, most of them aimed at a specific way a plausible reimplementation goes wrong (untransposed `comb`, symmetric SwiGLU clamp, sink folded into the loop, per-token instead of per-dimension pooling, and the MXFP4 SIMD decode vs the undoubled e2m1 LUT). |
 
 **What none of this proves:** that the architecture was transcribed correctly.
 The engine and the numpy oracle were written from the same reading of the same
@@ -293,8 +293,12 @@ Three real defects were caught this way, which is the argument for the harness:
 
 ## Next, in order of value
 
-1. **NEON `matmul_mxfp4`** — the expert kernel is scalar on Apple Silicon and it
-   is the hot loop. `quant.h` already has NEON idioms next to it.
+1. ✅ **NEON `matmul_mxfp4`** — done (2026-08-03). The expert kernel was scalar on
+   Apple Silicon and it is the hot loop; it now has a NEON path for `I%32==0`
+   (every DSV4 expert) that decodes each nibble to its doubled int8 via
+   `vqtbl1q_s8` and un-doubles through the group scale — the same shape as the
+   AVX2 branch, base NEON only (no DOTPROD/i8mm), pinned by an independent
+   scalar reference in `test_dsv4.c` (rel-L2 1e-5).
 2. **Batched expert I/O** — one `pread` per expert instead of six, `O_DIRECT`,
    and overlap with compute. `colibri.c` and `kimi_k3.c` already do all three.
    Chunked prefill made the reads dedupe; it did not make each one cheaper.

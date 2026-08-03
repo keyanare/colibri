@@ -516,7 +516,7 @@ deepseek_v4$(EXE): deepseek_v4.c dsv4.h dsv4_model.h st.h json.h tok.h tok_unico
 tests/test_tok_dsv4$(EXE): tests/test_tok_dsv4.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_dsv4$(EXE): tests/test_dsv4.c dsv4.h
+tests/test_dsv4$(EXE): tests/test_dsv4.c dsv4.h quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_dsv4_model$(EXE): tests/test_dsv4_model.c dsv4_model.h dsv4.h json.h
@@ -551,6 +551,13 @@ tests/test_topp$(EXE): tests/test_topp.c colibri.c st.h uring.h json.h tok.h tok
 # bench_topp is a microbenchmark (old qsort vs new heap partial-select, #335), NOT a test
 # gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_topp
 tests/bench_topp$(EXE): tests/bench_topp.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+
+# bench_mxfp4 is a microbenchmark (NEON vs true-scalar matmul_mxfp4), NOT a test
+# gate -- intentionally absent from TEST_BINS (file is bench_*, not test_*). Build
+# on demand: make tests/bench_mxfp4 ARCH=native
+tests/bench_mxfp4$(EXE): tests/bench_mxfp4.c quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_sample_nan$(EXE): tests/test_sample_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h

@@ -416,10 +416,7 @@ def main():
     if "avx2" in flags:
         r.add(OK, "AVX2 present", "matmul_mxfp4 uses its vector path (build with ARCH=native)")
     elif "neon" in flags:
-        r.add(WARN, "arm64 — MXFP4 runs SCALAR",
-              "quant.h's matmul_mxfp4 has an AVX2 path but no NEON one, and matmul_fp8\n"
-              "has no SIMD at all. Expect several times slower compute than an x86 box\n"
-              "of similar class. A NEON kernel is the single best optimization here.")
+        r.add(OK, "NEON present", "matmul_mxfp4 uses its NEON path (I%32==0, every DSV4 expert)")
     else:
         r.add(WARN, "no AVX2/NEON detected", "expert matmuls will run scalar")
     omp_ok = True

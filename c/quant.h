@@ -1463,6 +1463,57 @@ static void matmul_mxfp4(float *y, const float *x, const uint8_t *q4, const uint
                 y[(int64_t)s*O+o]=hsum256(acc);
                 continue;
             }
+#elif defined(__ARM_NEON)
+            if(I%32==0){
+                /* Mirror of the AVX2 path: the doubled e2m1 values are exact
+                 * int8, so one vqtbl1q_s8 (table lookup on the nibble) decodes a
+                 * 16-byte vector of packed nibbles to 16 signed doubled values;
+                 * the 0.5f un-doubling rides the group scale. Uses only base
+                 * NEON (no DOTPROD/i8mm) so it runs on every Apple Silicon and
+                 * ARMv8 core. Same denormal/inf bit-trick on the exponent as the
+                 * scalar path, so s=0 -> +0 and s=255 -> +inf alike. */
+                static const int8_t l2n[16]={0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12};
+                const int8x16_t lut=vld1q_s8(l2n);
+                const uint8x16_t m4=vdupq_n_u8(0x0F);
+                float32x4_t ac0=vdupq_n_f32(0),ac1=vdupq_n_f32(0),
+                            ac2=vdupq_n_f32(0),ac3=vdupq_n_f32(0);
+                for(int g=0;g<ng;g++){
+                    const uint8x16_t by=vld1q_u8(w+g*16);   /* 16 bytes = cols g*32..g*32+31 */
+                    /* low nibble = even column, high nibble = odd column */
+                    uint8x8_t lo0=vget_low_u8(vandq_u8(by,m4));
+                    uint8x8_t hi0=vget_low_u8(vshrq_n_u8(by,4));
+                    uint8x8_t lo1=vget_high_u8(vandq_u8(by,m4));
+                    uint8x8_t hi1=vget_high_u8(vshrq_n_u8(by,4));
+                    /* vzip interleaves even/odd columns back into column order */
+                    uint8x8x2_t z0=vzip_u8(lo0,hi0), z1=vzip_u8(lo1,hi1);
+                    int8x16_t v0=vqtbl1q_s8(lut,vcombine_u8(z0.val[0],z0.val[1])); /* cols +0..15 */
+                    int8x16_t v1=vqtbl1q_s8(lut,vcombine_u8(z1.val[0],z1.val[1])); /* cols +16..31 */
+                    /* 32 columns -> 8 float32x4 in column order */
+                    int16x8_t p0=vmovl_s8(vget_low_s8(v0)),  p1=vmovl_s8(vget_high_s8(v0));
+                    int16x8_t p2=vmovl_s8(vget_low_s8(v1)),  p3=vmovl_s8(vget_high_s8(v1));
+                    float32x4_t f0=vcvtq_f32_s32(vmovl_s16(vget_low_s16(p0)));
+                    float32x4_t f1=vcvtq_f32_s32(vmovl_s16(vget_high_s16(p0)));
+                    float32x4_t f2=vcvtq_f32_s32(vmovl_s16(vget_low_s16(p1)));
+                    float32x4_t f3=vcvtq_f32_s32(vmovl_s16(vget_high_s16(p1)));
+                    float32x4_t f4=vcvtq_f32_s32(vmovl_s16(vget_low_s16(p2)));
+                    float32x4_t f5=vcvtq_f32_s32(vmovl_s16(vget_high_s16(p2)));
+                    float32x4_t f6=vcvtq_f32_s32(vmovl_s16(vget_low_s16(p3)));
+                    float32x4_t f7=vcvtq_f32_s32(vmovl_s16(vget_high_s16(p3)));
+                    const float32x4_t scv=vdupq_n_f32(mx4_scale(scl[g])*0.5f);
+                    const float *xg=xs+g*32;
+                    ac0=vfmaq_f32(ac0,vld1q_f32(xg),    vmulq_f32(f0,scv));
+                    ac1=vfmaq_f32(ac1,vld1q_f32(xg+4),  vmulq_f32(f1,scv));
+                    ac2=vfmaq_f32(ac2,vld1q_f32(xg+8),  vmulq_f32(f2,scv));
+                    ac3=vfmaq_f32(ac3,vld1q_f32(xg+12), vmulq_f32(f3,scv));
+                    ac0=vfmaq_f32(ac0,vld1q_f32(xg+16), vmulq_f32(f4,scv));
+                    ac1=vfmaq_f32(ac1,vld1q_f32(xg+20), vmulq_f32(f5,scv));
+                    ac2=vfmaq_f32(ac2,vld1q_f32(xg+24), vmulq_f32(f6,scv));
+                    ac3=vfmaq_f32(ac3,vld1q_f32(xg+28), vmulq_f32(f7,scv));
+                }
+                a=vaddvq_f32(vaddq_f32(vaddq_f32(ac0,ac1),vaddq_f32(ac2,ac3)));
+                y[(int64_t)s*O+o]=a;
+                continue;
+            }
 #endif
             for(int g=0;g<ng;g++){
                 int base=g*32, glen=32; if(base+glen>I) glen=I-base;
