@@ -44,7 +44,7 @@ Three properties are unusual even by MoE standards:
 |---|---|---|
 | **mHC** | The residual stream is **four** vectors, not one. Each sublayer is entered by collapsing them to one and left by expanding back, mixed by a doubly stochastic matrix from 20 Sinkhorn iterations. | `dsv4_hc_pre` / `dsv4_hc_post` / `dsv4_sinkhorn` |
 | **Shared-KV attention with sinks** | One 512-dim latent per position serves every head as both key *and* value. A learnable per-head sink logit joins the softmax denominator. The output must be **de-rotated**, because the value side carries RoPE. | `dsv4_sparse_attn` |
-| **CSA / HCA** | Every layer attends to a 128-token sliding window. Layers with `compress_ratio > 0` also attend to compressed positions — one latent per 4 tokens (CSA, with a learned top-512 indexer) or per 128 (HCA, all of them). | `dsv4_compress_pool`, `dsv4_index_score` |
+| **CSA / HCA** | Every layer attends to a 128-token sliding window. Layers with `compress_ratio > 0` also attend to compressed positions — one latent per 4 tokens (CSA, with a learned top-512 indexer) or per 128 (HCA, all of them). Their `wkv`/`wgate` projections are the **one dense pair in the model that ships unquantized** — bf16, no `.scale` sidecar. | `dsv4_compress_pool`, `dsv4_index_score` |
 | **Hash + noaux_tc routing** | `sqrt(softplus(x))` scoring; the bias steers *selection* only, never the returned weights. The first 3 layers bypass scoring entirely via `tid2eid`. | `dsv4_route`, `dsv4_route_hash` |
 
 Two RoPE tables per model: compressed layers use `compress_rope_theta` (160000)
@@ -102,6 +102,15 @@ the head is not loaded; preflight reports its tensors as expected-unknown.
 
 The tables below were measured against the preview; -0731 adds ~7 GB of
 speculative weights that are never read.
+
+What HAS been checked against the real -0731 container, from its safetensors
+headers alone: the tensor names of the main stack, `compress_ratios` (it is the
+`[0,0] + [4,128]*20 + [4]` interleave the manifest assumed, plus three trailing
+zeros), the 41 compressor / 21 indexer layer sets, and that the dtype and byte
+count of every quantized tensor reconciles exactly — 35328 expert tensors,
+390 dense fp8, 35718 scale sidecars, 3 int64 `tid2eid` tables. That is names and
+shapes agreeing. It says nothing about whether the weights are being *used*
+correctly, which still needs the token-exact oracle.
 
 ## Running it
 
@@ -189,7 +198,7 @@ whole working set: **6 experts × 43 layers × 13.4 MB ≈ 3.4 GB read per token
 
 | | Apple M5, 16 GB, ~5 GB/s SSD | i7-11700, 32 GB, 3 GB/s NVMe |
 |---|---|---|
-| resident | ~7.2 GB | ~7.2 GB |
+| resident | ~8.1 GB | ~8.1 GB |
 | expert cache | 3–4 GB (~5 experts/layer) | ~20 GB (~35 experts/layer) |
 | expert kernels | **scalar** (no NEON path yet) | AVX2 |
 | estimate | ~1.5–3 s/token | ~1.5–3 s/token |

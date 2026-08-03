@@ -228,9 +228,17 @@ static void dsv4_push(DSV4List *L, int role, int optional, int64_t d0, int64_t d
 static void dsv4_compressor_tensors(DSV4List *L, const DSV4Cfg *c, const char *prefix,
                                     int ratio, int hd){
     int coff=dsv4_coff(ratio);
+    /* wkv/wgate are NOT quantized. Every other projection in this model is fp8
+     * with a `.scale` sidecar, and these were classified with them by analogy;
+     * the checkpoint has no `<prefix>.wkv.scale` at all, and the tensors are
+     * bf16. The evidence closed exactly: 41 attention compressors + 21 indexer
+     * compressors, two tensors each, is 124 -- precisely the gap between the
+     * 490 fp8 tensors this manifest expected and the 390 the checkpoint holds.
+     * Small enough to be plausible either way, which is why the sidecar's
+     * absence, not the byte count, is what settles it. */
     dsv4_push(L,DSV4_T_PLAIN,0,ratio,(int64_t)coff*hd, "%s.ape",   prefix);
-    dsv4_push(L,DSV4_T_FP8,  0,(int64_t)coff*hd,c->dim, "%s.wkv.weight",   prefix);
-    dsv4_push(L,DSV4_T_FP8,  0,(int64_t)coff*hd,c->dim, "%s.wgate.weight", prefix);
+    dsv4_push(L,DSV4_T_PLAIN,0,(int64_t)coff*hd,c->dim, "%s.wkv.weight",   prefix);
+    dsv4_push(L,DSV4_T_PLAIN,0,(int64_t)coff*hd,c->dim, "%s.wgate.weight", prefix);
     dsv4_push(L,DSV4_T_PLAIN,0,hd,0,                    "%s.norm.weight",  prefix);
 }
 

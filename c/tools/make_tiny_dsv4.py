@@ -207,8 +207,11 @@ def build(outdir, seed=1234):
     def compressor(prefix, ratio, hd):
         c = coff(ratio)
         g.plain(f"{prefix}.ape", (ratio, c * hd), scale=0.3)
-        g.fp8(f"{prefix}.wkv.weight", c * hd, D)
-        g.fp8(f"{prefix}.wgate.weight", c * hd, D)
+        # bf16, not fp8: the compressor projections are the one dense pair in
+        # this model that ships unquantized -- no .scale sidecar exists for
+        # them in the checkpoint.
+        g.plain(f"{prefix}.wkv.weight", (c * hd, D), scale=0.1)
+        g.plain(f"{prefix}.wgate.weight", (c * hd, D), scale=0.1)
         g.plain(f"{prefix}.norm.weight", (hd,), scale=0.2)
 
     for l, ratio in enumerate(cfg["compress_ratios"][:cfg["num_hidden_layers"]]):

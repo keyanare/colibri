@@ -304,7 +304,9 @@ static void test_expert_grid(void){
             CHECK(MAN[i].d0==CFG.dim && MAN[i].d1==CFG.moe_inter_dim);
             CHECK(MAN[i].role==DSV4_T_FP4);
         }
-        /* the shared expert is NOT fp4 in the reference */
+        /* the shared expert is NOT fp4 in the reference -- it is fp8, which the
+         * published checkpoint confirms: [2048,4096] at exactly O*I bytes with
+         * a .scale sidecar next to it. */
         if(!strcmp(MAN[i].name,"layers.7.ffn.shared_experts.w1.weight"))
             CHECK(MAN[i].role==DSV4_T_FP8);
     }
@@ -356,6 +358,14 @@ static void test_roles(void){
         if(strstr(t->name,"_norm.weight")||strstr(t->name,".ape")
            ||strstr(t->name,"attn_sink")||strstr(t->name,"hc_"))
             CHECK(t->role==DSV4_T_PLAIN);
+        /* The compressor projections are unquantized -- and ONLY those. The
+         * same leaf names under .attn (wkv) are fp8, so match the prefix, not
+         * the leaf: pinning this is what keeps a future edit from "restoring"
+         * the symmetry the rest of the model has. */
+        if(strstr(t->name,".compressor.wkv.weight")
+           ||strstr(t->name,".compressor.wgate.weight"))
+            CHECK(t->role==DSV4_T_PLAIN);
+        if(strstr(t->name,".attn.wkv.weight")) CHECK(t->role==DSV4_T_FP8);
         CHECK(t->d0>0);
         CHECK(t->d1>=0);
         CHECK(t->name[0]!=0);

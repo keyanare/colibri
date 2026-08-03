@@ -348,8 +348,10 @@ static void compressor_init(Model *m, Compressor *C, shards *S, const char *pref
         snprintf(t.name,sizeof t.name,"%s." suffix,prefix); \
         w_load(S,&t,&C->field,1); }while(0)
     LOADC(ape,   DSV4_T_PLAIN, ratio, (int64_t)C->coff*hd, "ape");
-    LOADC(wkv,   DSV4_T_FP8,   (int64_t)C->coff*hd, m->c.dim, "wkv.weight");
-    LOADC(wgate, DSV4_T_FP8,   (int64_t)C->coff*hd, m->c.dim, "wgate.weight");
+    /* PLAIN, not FP8: the compressor projections ship unquantized, with no
+     * .scale sidecar -- see dsv4_compressor_tensors. */
+    LOADC(wkv,   DSV4_T_PLAIN, (int64_t)C->coff*hd, m->c.dim, "wkv.weight");
+    LOADC(wgate, DSV4_T_PLAIN, (int64_t)C->coff*hd, m->c.dim, "wgate.weight");
     LOADC(norm,  DSV4_T_PLAIN, hd, 1, "norm.weight");
     #undef LOADC
     size_t st_n=(size_t)C->coff*ratio*(size_t)C->coff*hd;

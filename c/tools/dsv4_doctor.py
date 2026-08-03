@@ -127,6 +127,26 @@ def expert_bytes(c):
             + (D * ((MI + 1) // 2) + D * ((MI + 31) // 32)))
 
 
+def compressor_params(c):
+    """Parameters in the compressor projections: wkv + wgate, for the attention
+    compressor and the indexer's own.
+
+    They get their own function because they are the one dense pair in this
+    model that ships UNQUANTIZED -- bf16 on disk, expanded to f32 in RAM -- so
+    disk and resident disagree about them by 2x and neither bucket above fits.
+    At ~390M parameters that is the difference between a 0.4 GB line item and a
+    1.6 GB one, which is not a rounding error on a 16 GB machine."""
+    D, HD = c["dim"], c["head_dim"]
+    n = 0
+    for r in c["compress_ratios"][:c["n_layers"]]:
+        if not r:
+            continue
+        n += 2 * ((2 if r == 4 else 1) * HD * D)
+        if r == 4:
+            n += 2 * (2 * c["index_head_dim"] * D)
+    return n
+
+
 def resident_bytes(c, max_seq=8192):
     """What the engine must hold in RAM before any expert is cached.
 
@@ -147,15 +167,11 @@ def resident_bytes(c, max_seq=8192):
     fp8 += L * c["n_shared_experts"] * (2 * MI * D + D * MI)       # shared expert
     fp8 += c["vocab_size"] * D                                      # lm head
     for r in ratios:
-        if not r:
-            continue
-        coff = 2 if r == 4 else 1
-        fp8 += 2 * (coff * HD * D)                                  # compressor
         if r == 4:
             fp8 += c["index_n_heads"] * c["index_head_dim"] * c["q_lora_rank"]
-            fp8 += 2 * (2 * c["index_head_dim"] * D)                # its compressor
 
-    f32 = 0
+    f32 = compressor_params(c)                                      # see below
+
     f32 += L * 2 * hcmix * c["hc_mult"] * D                         # hc_*_fn
     f32 += L * c["n_routed_experts"] * D                            # routers
     f32 += L * (2 * D + c["q_lora_rank"] + HD)                      # norms
@@ -173,8 +189,11 @@ def resident_bytes(c, max_seq=8192):
 def disk_bytes(c):
     """Whole checkpoint: experts dominate at 97%."""
     L = c["n_layers"]
+    # resident_bytes holds the compressor projections as f32 because that is
+    # what the engine expands them to; on disk they are bf16, hence the -2/param.
     return int(L * c["n_routed_experts"] * expert_bytes(c)
-               + resident_bytes(c, max_seq=0) + c["vocab_size"] * c["dim"] * 2)
+               + resident_bytes(c, max_seq=0) - 2 * compressor_params(c)
+               + c["vocab_size"] * c["dim"] * 2)
 
 
 # ---------------------------------------------------------------- host probes
