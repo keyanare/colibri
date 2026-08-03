@@ -9,9 +9,13 @@ An engine for [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4
 > checkpoint. The compute primitives, the tensor manifest, the tokenizer and
 > the full forward pass all have tests — but the only thing that closes the gap
 > between "self-consistent" and "correct" is a token-exact oracle on real
-> weights, and that has not been run. **Expect the first run on a real
-> checkpoint to fail on a tensor name or shape.** That failure is designed to be
-> a precise message, not garbage output.
+> weights, and that has not been run.
+>
+> **`--preflight` now passes on the real `-0731` container: 34223/34223 names
+> and shapes matched** (2026-08-03, four corrections deep — see *Which
+> checkpoint*). That is a header-only check. **No weight byte of the real
+> checkpoint has ever been read by this engine, and no forward pass has ever
+> been run on it.** Everything past the manifest is still unverified.
 
 ---
 
@@ -112,17 +116,23 @@ count of every quantized tensor reconciles exactly — 35328 expert tensors,
 shapes agreeing. It says nothing about whether the weights are being *used*
 correctly, which still needs the token-exact oracle.
 
-Three conventions the derivation got wrong, all found this way:
+Four conventions the derivation got wrong, all found this way:
 
 | | assumed | actual |
 |---|---|---|
+| speculative head | 1 MTP layer (`num_nextn_predict_layers`) | **3 DSpark modules**, counted by `dspark_target_layer_ids` |
 | scale sidecar name | `<name>.weight.scale` | **`<stem>.scale`** — the suffix is replaced, not appended (`dsv4_scale_name`) |
 | compressor `wkv`/`wgate` | fp8 + sidecar | **bf16**, no sidecar |
 | `head.weight` | fp8 + sidecar | **bf16**, no sidecar |
 
-The first one is the instructive failure: appending rather than replacing made
-*every* quantized tensor report "sidecar absent" while the real sidecars piled
-up in the not-covered list — 33389 scale problems from one string operation.
+Also `st.h` had no entry for `F8_E4M3` — colibrì's own containers spell fp8
+weight bytes `U8`, so nothing had ever needed one.
+
+The sidecar name is the instructive failure: appending rather than replacing
+made *every* quantized tensor report "sidecar absent" while the real sidecars
+piled up in the not-covered list — 33389 scale problems from one string
+operation. Each of the four surfaced as a named, specific message, which is the
+argument for preflight over a crash mid-load.
 
 ## Running it
 
