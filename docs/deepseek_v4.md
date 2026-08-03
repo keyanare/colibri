@@ -11,11 +11,14 @@ An engine for [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4
 > between "self-consistent" and "correct" is a token-exact oracle on real
 > weights, and that has not been run.
 >
-> **`--preflight` now passes on the real `-0731` container: 34223/34223 names
-> and shapes matched** (2026-08-03, four corrections deep — see *Which
-> checkpoint*). That is a header-only check. **No weight byte of the real
-> checkpoint has ever been read by this engine, and no forward pass has ever
-> been run on it.** Everything past the manifest is still unverified.
+> **It now runs on the real `-0731` checkpoint** (2026-08-03). `--preflight`
+> matches 34223/34223 names and shapes; a 197-token prompt — past the 128
+> sliding window, so the CSA and HCA paths carry it — produces coherent,
+> in-context continuation. **That is not correctness.** Nothing has been
+> compared against a reference implementation on real weights: a subtly wrong
+> compressed path, a tie broken the other way in the indexer's top-512, or an
+> off-by-one in the compressor's prefill would all still read as fluent text.
+> The token-exact oracle remains the only thing that would close it.
 
 ---
 
@@ -223,14 +226,19 @@ whole working set: **6 experts × 43 layers × 13.4 MB ≈ 3.4 GB read per token
 | resident | ~9.7 GB | ~9.7 GB |
 | expert cache | 3–4 GB (~5 experts/layer) | ~20 GB (~35 experts/layer) |
 | expert kernels | **scalar** (no NEON path yet) | AVX2 |
-| estimate | ~1.5–3 s/token | ~1.5–3 s/token |
+| estimate | ~1.5–3 s/token | **measured: 3.8 s/token prefill, 4.0 s/token decode** (`--expert-gb 3.5`, 197-token prompt) |
 
 They land in the same place for different reasons: the Mac has a faster SSD but
 a cache too small to help; the PC has a usable cache but half the bandwidth.
 Neither has a GPU path — **there is no CUDA or Metal backend for this engine.**
 
-Prefill runs one token at a time, so a 50-token prompt costs 50 forward passes
-before the first generated token.
+Prefill runs one token at a time, so a 197-token prompt cost **12 minutes**
+before the first generated character — each prompt token is a full forward pass
+with the same ~3.4 GB of expert reads as a generated one. The engine prints
+progress and an estimate so the wait is legible, but the fix is batching: all
+prompt tokens pass through the SAME expert weights, so an expert read once and
+applied to every token that routed to it turns prefill from I/O-bound into
+compute-bound. Nothing in the design prevents it.
 
 ---
 

@@ -1183,6 +1183,10 @@ int main(int argc, char **argv){
         }
     }
     if(g_verbose && n_ids>1) fprintf(stderr,"\n");
+    /* Prefill and decode are different regimes -- one is N forward passes with
+     * no output, the other is one per token -- and averaging them reported
+     * 0.03 tok/s for a run that decoded at 0.25. Time them apart. */
+    double t_pre=now_s();
 
     char piece[512];
     int gen=0, hit_stop=0;
@@ -1210,11 +1214,16 @@ int main(int argc, char **argv){
         if(pos>=g_max_seq-1) break;
     }
     if(dump){ fprintf(dump,"]}\n"); fclose(dump); }
-    double dt=now_s()-t0;
+    double dt=now_s()-t_pre, pre=t_pre-t0;
     /* `gen`, not g_ngen: the loop can end early on a stop id or on max-seq, and
      * reporting the request instead of the result overstates tok/s. */
-    fprintf(stderr,"\n  %d tokens in %.1fs (%.2f tok/s)%s | experts: %llu hit / %llu miss, %.1fs loading\n",
-            gen,dt,dt>0?gen/dt:0.0, hit_stop?" [stopped at eos]":"",
+    fprintf(stderr,"\n");
+    if(n_ids>1)
+        fprintf(stderr,"  prefill: %d tokens in %.1fs (%.1f s/token)\n",
+                n_ids-1,pre,pre/(n_ids-1));
+    fprintf(stderr,"  decode:  %d tokens in %.1fs (%.2f tok/s)%s\n",
+            gen,dt,dt>0?gen/dt:0.0, hit_stop?" [stopped at eos]":"");
+    fprintf(stderr,"  experts: %llu hit / %llu miss, %.1fs loading\n",
             (unsigned long long)m.expert_hits,(unsigned long long)m.expert_miss,m.expert_load_s);
     free(ids);
     return 0;
