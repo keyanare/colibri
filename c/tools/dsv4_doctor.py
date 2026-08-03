@@ -127,6 +127,15 @@ def expert_bytes(c):
             + (D * ((MI + 1) // 2) + D * ((MI + 31) // 32)))
 
 
+def unquantized_params(c):
+    """Dense parameters the checkpoint ships UNQUANTIZED: the lm head and the
+    compressor projections. bf16 on disk, expanded to f32 in RAM, so the two
+    accountings differ by 2x and neither the fp8 nor the small-tensor bucket
+    fits. Both were costed as fp8 until the published checkpoint was read --
+    together ~0.9B parameters, i.e. 0.9 GB assumed against 3.5 GB resident."""
+    return c["vocab_size"] * c["dim"] + compressor_params(c)
+
+
 def compressor_params(c):
     """Parameters in the compressor projections: wkv + wgate, for the attention
     compressor and the indexer's own.
@@ -150,9 +159,10 @@ def compressor_params(c):
 def resident_bytes(c, max_seq=8192):
     """What the engine must hold in RAM before any expert is cached.
 
-    Mirrors deepseek_v4.c: dense weights are fp8 (1 byte/param), the small
-    tensors it keeps as f32 are 4, embed.weight is NOT resident (one row is
-    read per token), and the KV/compressed caches scale with max_seq."""
+    Mirrors deepseek_v4.c: quantized dense weights are fp8 (1 byte/param), the
+    unquantized ones and the small tensors it keeps as f32 are 4, embed.weight
+    is NOT resident (one row is read per token), and the KV/compressed caches
+    scale with max_seq."""
     D, L = c["dim"], c["n_layers"]
     HD, H = c["head_dim"], c["n_heads"]
     hs = H * HD
@@ -165,13 +175,11 @@ def resident_bytes(c, max_seq=8192):
                 + D * c["o_groups"] * c["o_lora_rank"])
     MI = c["moe_intermediate_size"]
     fp8 += L * c["n_shared_experts"] * (2 * MI * D + D * MI)       # shared expert
-    fp8 += c["vocab_size"] * D                                      # lm head
     for r in ratios:
         if r == 4:
             fp8 += c["index_n_heads"] * c["index_head_dim"] * c["q_lora_rank"]
 
-    f32 = compressor_params(c)                                      # see below
-
+    f32 = unquantized_params(c)                                     # lm head + compressors
     f32 += L * 2 * hcmix * c["hc_mult"] * D                         # hc_*_fn
     f32 += L * c["n_routed_experts"] * D                            # routers
     f32 += L * (2 * D + c["q_lora_rank"] + HD)                      # norms
@@ -189,10 +197,10 @@ def resident_bytes(c, max_seq=8192):
 def disk_bytes(c):
     """Whole checkpoint: experts dominate at 97%."""
     L = c["n_layers"]
-    # resident_bytes holds the compressor projections as f32 because that is
-    # what the engine expands them to; on disk they are bf16, hence the -2/param.
+    # resident_bytes holds the unquantized dense weights as f32 because that is
+    # what the engine expands them to; on disk they are bf16, hence -2/param.
     return int(L * c["n_routed_experts"] * expert_bytes(c)
-               + resident_bytes(c, max_seq=0) - 2 * compressor_params(c)
+               + resident_bytes(c, max_seq=0) - 2 * unquantized_params(c)
                + c["vocab_size"] * c["dim"] * 2)
 
 

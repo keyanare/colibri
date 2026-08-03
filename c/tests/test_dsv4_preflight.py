@@ -109,7 +109,7 @@ class Preflight(unittest.TestCase):
 
     def test_missing_scale_sidecar_is_caught(self):
         d = self.variant("scale",
-                         lambda h: h.pop("layers.0.ffn.experts.3.w1.weight.scale"))
+                         lambda h: h.pop("layers.0.ffn.experts.3.w1.scale"))
         r = self.run_preflight(d)
         self.assertEqual(r.returncode, 1)
         self.assertIn("NO SCALE", r.stderr)

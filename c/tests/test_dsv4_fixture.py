@@ -78,8 +78,11 @@ class TinyDsv4Oracle(unittest.TestCase):
                              "layers.1.attn.compressor.ape",      # CSA compressor
                              "layers.1.attn.indexer.wq_b.weight", # lightning indexer
                              "layers.1.attn.indexer.compressor.ape",
-                             "layers.0.ffn.experts.0.w1.weight.scale",  # mxfp4 sidecar
-                             "layers.0.attn.wq_a.weight.scale",         # fp8 ue8m0 sidecar
+                             # the sidecar REPLACES the .weight suffix -- appending
+                             # it instead is what made every quantized tensor read
+                             # as "no scale" against the real container
+                             "layers.0.ffn.experts.0.w1.scale",   # mxfp4 sidecar
+                             "layers.0.attn.wq_a.scale",          # fp8 ue8m0 sidecar
                              "hc_head_fn"):                       # head collapse gates
                 self.assertIn(required, names, f"fixture is missing {required}")
             self.assertNotIn("layers.0.attn.compressor.ape", names,

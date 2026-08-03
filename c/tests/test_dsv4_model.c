@@ -21,15 +21,15 @@ static int fails=0;
  * one belongs to the MTP head (num_nextn_predict_layers=1), which is why
  * dsv4_cfg_from_json accepts n_layers or n_layers+n_nextn.
  *
- * The INTERIOR of the array (exactly where the 4/128 alternation falls) is NOT
- * asserted anywhere in this file. It was read from the published config
- * through a summarizing fetch that gave inconsistent answers about the tail on
- * two attempts, so pinning a specific interleave here would pin a guess. What
- * IS asserted is structural and independently sound: the element count, the
- * leading zeros, the trailing zero, and that every value is one of {0,4,128}
- * (the only three dsv4_coff / dsv4_has_indexer distinguish). The manifest
- * reads the array from the config at runtime, so nothing downstream depends on
- * this literal being the real interleave -- only on it being well-formed. */
+ * The INTERIOR of the array was long unverified here -- it reached this file
+ * through a summarizing fetch that gave inconsistent answers about the tail --
+ * so what is asserted below is structural rather than literal: the element
+ * count, the leading zeros, the trailing zero, and that every value is one of
+ * {0,4,128} (the only three dsv4_coff / dsv4_has_indexer distinguish). The
+ * published -0731 config has since been read directly and DOES have this
+ * interleave, with 41 compressor and 21 indexer layers to match. The
+ * assertions stay structural anyway: the manifest reads the array from the
+ * config at runtime, so nothing downstream depends on this literal. */
 static const char *CFG_JSON =
 "{\"hidden_size\":4096,\"num_hidden_layers\":43,\"num_attention_heads\":64,"
 "\"head_dim\":512,\"qk_rope_head_dim\":64,\"q_lora_rank\":1024,\"o_lora_rank\":1024,"
@@ -178,6 +178,28 @@ static void test_cfg_accepts_dspark_head(void){
     CHECK(dsv4_cfg_from_json(r2,&c2)==-1);
 }
 
+/* The block-scale sidecar REPLACES the `.weight` suffix. Appending `.scale` to
+ * the full name instead produces `<stem>.weight.scale`, which exists nowhere in
+ * the real container: every quantized tensor then reads as "sidecar absent"
+ * while the real sidecars pile up in the not-covered list. That is what a first
+ * run against the published checkpoint looked like, so pin the convention. */
+static void test_scale_names(void){
+    char b[192];
+    dsv4_scale_name(b,sizeof b,"layers.0.attn.wkv.weight");
+    CHECK(!strcmp(b,"layers.0.attn.wkv.scale"));
+    dsv4_scale_name(b,sizeof b,"layers.7.ffn.experts.100.w1.weight");
+    CHECK(!strcmp(b,"layers.7.ffn.experts.100.w1.scale"));
+    dsv4_scale_name(b,sizeof b,"layers.2.attn.indexer.wq_b.weight");
+    CHECK(!strcmp(b,"layers.2.attn.indexer.wq_b.scale"));
+    /* A name without the suffix gets `.scale` appended rather than losing
+     * seven characters of itself. */
+    dsv4_scale_name(b,sizeof b,"head");
+    CHECK(!strcmp(b,"head.scale"));
+    /* ".weight" alone is exactly the suffix length: must not underflow to "". */
+    dsv4_scale_name(b,sizeof b,".weight");
+    CHECK(!strcmp(b,".weight.scale"));
+}
+
 static DSV4Tensor *MAN; static int NMAN;
 
 static void test_manifest_count_matches(void){
@@ -210,10 +232,11 @@ static void test_layer_classes(void){
     }
     CHECK(with_compressor==expect_c);
     CHECK(with_indexer==expect_i);
-    /* Bounds, not exact counts: the interleave interior is unverified (see the
-     * CFG_JSON note), but every indexer layer is a compressor layer, both are
-     * a strict subset of the stack, and the two leading ratio-0 layers plus at
-     * least one more mean the compressor count cannot reach n_layers. */
+    /* Bounds, not exact counts, so this test does not depend on the literal
+     * above (see the CFG_JSON note): every indexer layer is a compressor layer,
+     * both are a strict subset of the stack, and the two leading ratio-0 layers
+     * plus at least one more mean the compressor count cannot reach n_layers.
+     * On the real config these come out 41 and 21. */
     CHECK(expect_i>0 && expect_i<=expect_c);
     CHECK(expect_c>0 && expect_c<CFG.n_layers);
 
@@ -366,6 +389,9 @@ static void test_roles(void){
            ||strstr(t->name,".compressor.wgate.weight"))
             CHECK(t->role==DSV4_T_PLAIN);
         if(strstr(t->name,".attn.wkv.weight")) CHECK(t->role==DSV4_T_FP8);
+        /* The two biggest dense tensors are unquantized in the checkpoint. */
+        if(!strcmp(t->name,"head.weight"))  CHECK(t->role==DSV4_T_PLAIN);
+        if(!strcmp(t->name,"embed.weight")) CHECK(t->role==DSV4_T_PLAIN);
         CHECK(t->d0>0);
         CHECK(t->d1>=0);
         CHECK(t->name[0]!=0);
@@ -387,6 +413,7 @@ int main(void){
     test_cfg_refuses_mismatch();
     test_cfg_refuses_unknown_ratio();
     test_cfg_accepts_dspark_head();
+    test_scale_names();
     test_manifest_count_matches();
     if(!MAN){ printf("dsv4 model tests: manifest alloc failed\n"); return 1; }
     test_layer_classes();

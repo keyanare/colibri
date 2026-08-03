@@ -201,6 +201,23 @@ static int dsv4_cfg_from_json(jval *r, DSV4Cfg *c){
     return 0;
 }
 
+/* The block-scale sidecar for `<stem>.weight` is `<stem>.scale`: the checkpoint
+ * REPLACES the suffix, it does not append to the full name. Appending gives
+ * `<stem>.weight.scale`, which exists nowhere in the container -- every
+ * quantized tensor then reads as "sidecar absent" while the real sidecars pile
+ * up in the not-covered list. One function so the loader and preflight cannot
+ * drift apart on it. A name that does not end in `.weight` gets the suffix
+ * appended, which is what the two non-`.weight` roles would need if they ever
+ * gained a sidecar. */
+static void dsv4_scale_name(char *out, size_t cap, const char *weight_name){
+    size_t n=strlen(weight_name);
+    const char *suf=".weight"; size_t sl=7;
+    if(n>sl && !strcmp(weight_name+n-sl,suf)) n-=sl;
+    if(n+7 >= cap) n = cap>7 ? cap-8 : 0;      /* truncate rather than overflow */
+    memcpy(out,weight_name,n);
+    memcpy(out+n,".scale",7);                  /* includes the NUL */
+}
+
 /* A compressor with ratio 4 overlaps its group with the previous one, which
  * doubles the width of its kv/gate projections and its positional embedding.
  * `coff` (1 + overlap) is that factor; it is the single place the CSA-vs-HCA
@@ -317,7 +334,11 @@ static void dsv4_layer_tensors(DSV4List *L, const DSV4Cfg *c, int l){
 static void dsv4_global_tensors(DSV4List *L, const DSV4Cfg *c){
     dsv4_push(L,DSV4_T_PLAIN,0,c->vocab_size,c->dim, "embed.weight");
     dsv4_push(L,DSV4_T_PLAIN,0,c->dim,0,             "norm.weight");
-    dsv4_push(L,DSV4_T_FP8,  0,c->vocab_size,c->dim, "head.weight");
+    /* PLAIN, not FP8. The output projection is the largest single dense tensor
+     * in the model and the obvious candidate for quantization, but the
+     * checkpoint ships it bf16 -- 2 bytes/element, and no `head.scale` exists
+     * beside it. Same class as embed.weight, which it mirrors. */
+    dsv4_push(L,DSV4_T_PLAIN,0,c->vocab_size,c->dim, "head.weight");
     /* The head's OWN hyper-connection gates, which collapse the hc_mult
      * residual streams to one before the output norm. Note the row count is
      * hc_mult, not (2+hc)*hc: only the `pre` family exists here, because

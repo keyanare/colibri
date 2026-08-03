@@ -112,6 +112,18 @@ count of every quantized tensor reconciles exactly — 35328 expert tensors,
 shapes agreeing. It says nothing about whether the weights are being *used*
 correctly, which still needs the token-exact oracle.
 
+Three conventions the derivation got wrong, all found this way:
+
+| | assumed | actual |
+|---|---|---|
+| scale sidecar name | `<name>.weight.scale` | **`<stem>.scale`** — the suffix is replaced, not appended (`dsv4_scale_name`) |
+| compressor `wkv`/`wgate` | fp8 + sidecar | **bf16**, no sidecar |
+| `head.weight` | fp8 + sidecar | **bf16**, no sidecar |
+
+The first one is the instructive failure: appending rather than replacing made
+*every* quantized tensor report "sidecar absent" while the real sidecars piled
+up in the not-covered list — 33389 scale problems from one string operation.
+
 ## Running it
 
 ### 0. Check the machine first
@@ -198,7 +210,7 @@ whole working set: **6 experts × 43 layers × 13.4 MB ≈ 3.4 GB read per token
 
 | | Apple M5, 16 GB, ~5 GB/s SSD | i7-11700, 32 GB, 3 GB/s NVMe |
 |---|---|---|
-| resident | ~8.1 GB | ~8.1 GB |
+| resident | ~9.7 GB | ~9.7 GB |
 | expert cache | 3–4 GB (~5 experts/layer) | ~20 GB (~35 experts/layer) |
 | expert kernels | **scalar** (no NEON path yet) | AVX2 |
 | estimate | ~1.5–3 s/token | ~1.5–3 s/token |
@@ -259,9 +271,14 @@ Three real defects were caught this way, which is the argument for the harness:
    is the hot loop. `quant.h` already has NEON idioms next to it.
 2. **Batched expert I/O** — one `pread` per expert instead of six, `O_DIRECT`,
    and overlap with compute. `colibri.c` and `kimi_k3.c` already do all three.
-3. **Exact prefetch on the hash layers** — the one place in this repository where
+3. **Keep the unquantized tensors bf16 in RAM.** `head.weight` alone is 1.06 GB
+   on disk and 2.1 GB resident, because the PLAIN role expands everything to
+   f32 at load. Together with the compressor projections that is ~3.5 GB held
+   at twice the necessary width — the difference between fitting and swapping
+   on a 16 GB machine.
+4. **Exact prefetch on the hash layers** — the one place in this repository where
    the working set is knowable in advance.
-4. **A token-exact oracle** on the real checkpoint. Everything above is
+5. **A token-exact oracle** on the real checkpoint. Everything above is
    provisional until this exists.
 
 ---

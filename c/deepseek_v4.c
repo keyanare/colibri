@@ -168,8 +168,9 @@ static void w_free(W *w){
     memset(w,0,sizeof *w);
 }
 
-/* Load one tensor named by the manifest. `scale_suffix` is ".scale" -- the
- * checkpoint's own convention, NOT colibri.c's ".qs". */
+/* Load one tensor named by the manifest. The block-scale sidecar is named by
+ * dsv4_scale_name -- `<stem>.scale`, the checkpoint's own convention, NOT
+ * colibri.c's ".qs" and NOT the full name with ".scale" appended. */
 static int w_load(shards *S, const DSV4Tensor *t, W *w, int required){
     memset(w,0,sizeof *w);
     if(!st_has(S,t->name)){
@@ -177,7 +178,7 @@ static int w_load(shards *S, const DSV4Tensor *t, W *w, int required){
         return 0;
     }
     w->role=t->role; w->O=t->d0; w->I=t->d1?t->d1:1;
-    char sn[192]; snprintf(sn,sizeof sn,"%s.scale",t->name);
+    char sn[192]; dsv4_scale_name(sn,sizeof sn,t->name);
 
     if(t->role==DSV4_T_FP8){
         int64_t nb=st_nbytes(S,t->name), want=w->O*w->I;
@@ -984,8 +985,8 @@ static int preflight(const char *dir){
          * surface in the "not covered by the manifest" list, which reads as a
          * second, unrelated problem. */
         st_tensor *ss=NULL;
+        char sn0[192]; dsv4_scale_name(sn0,sizeof sn0,t->name);
         if(t->role==DSV4_T_FP8 || t->role==DSV4_T_FP4){
-            char sn0[192]; snprintf(sn0,sizeof sn0,"%s.scale",t->name);
             ss=st_find(&S,sn0);
             if(ss) seen[ss - S.t]=1;
         }
@@ -1009,7 +1010,7 @@ static int preflight(const char *dir){
         /* scale sidecar, where the role has one */
         if(t->role==DSV4_T_FP8 || t->role==DSV4_T_FP4){
             if(!ss){
-                badscale++; PF_SHOW("  NO SCALE  %s.scale is absent\n",t->name);
+                badscale++; PF_SHOW("  NO SCALE  %s is absent\n",sn0);
                 continue;
             }
             int64_t I=t->d1?t->d1:1;
@@ -1018,8 +1019,8 @@ static int preflight(const char *dir){
                          : t->d0*((I+31)/32);
             int fp8_f32 = (t->role==DSV4_T_FP8 && ss->nbytes==nblk*4);
             if(ss->nbytes!=nblk && !fp8_f32){
-                badscale++; PF_SHOW("  SCALE     %s.scale is %lld bytes, expected %lld (ue8m0)%s\n",
-                    t->name,(long long)ss->nbytes,(long long)nblk,
+                badscale++; PF_SHOW("  SCALE     %s is %lld bytes, expected %lld (ue8m0)%s\n",
+                    sn0,(long long)ss->nbytes,(long long)nblk,
                     t->role==DSV4_T_FP8 ? " or 4x that (f32)" : "");
                 continue;
             }

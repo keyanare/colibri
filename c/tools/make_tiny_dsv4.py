@@ -83,6 +83,14 @@ class Gen:
     def _put(self, name, dtype, shape, raw):
         self.tensors[name] = (dtype, list(shape), raw)
 
+    @staticmethod
+    def _scale_name(name):
+        """The checkpoint names the sidecar `<stem>.scale`, REPLACING the
+        `.weight` suffix rather than appending to it. Mirrors dsv4_scale_name
+        in dsv4_model.h -- the fixture is only a gate if it spells names the
+        way the real container does."""
+        return (name[:-len(".weight")] if name.endswith(".weight") else name) + ".scale"
+
     def plain(self, name, shape, scale=1.0):
         v = (self.rng.standard_normal(shape) * scale).astype(np.float32)
         raw = bf16_bytes(v)
@@ -103,7 +111,7 @@ class Gen:
         # bytes are identical either way -- what this exercises is st.h's dtype
         # table, which had no entry for it until a real checkpoint was read.
         self._put(name, "F8_E4M3", (O, I), b.tobytes())
-        self._put(name + ".scale", "F8_E8M0", (nbO, nbI), e.tobytes())
+        self._put(self._scale_name(name), "F8_E8M0", (nbO, nbI), e.tobytes())
         s = ue8m0(e)
         w = E4M3[b] * np.repeat(np.repeat(s, 128, 0), 128, 1)[:O, :I]
         self.values[name] = w.astype(np.float32)
@@ -116,7 +124,7 @@ class Gen:
         ng = (I + 31) // 32
         e = self.rng.integers(122, 133, size=(O, ng), dtype=np.uint8)
         self._put(name, "U8", (O, I // 2), packed.tobytes())
-        self._put(name + ".scale", "F8_E8M0", (O, ng), e.tobytes())
+        self._put(self._scale_name(name), "F8_E8M0", (O, ng), e.tobytes())
         lo, hi = packed & 0x0F, packed >> 4
         vals = np.empty((O, I), dtype=np.float32)
         vals[:, 0::2] = MX4[lo]          # low nibble = EVEN column
@@ -199,7 +207,9 @@ def build(outdir, seed=1234):
 
     g.plain("embed.weight", (V, D))
     g.plain("norm.weight", (D,), scale=0.2)
-    g.fp8("head.weight", V, D)
+    # bf16: the checkpoint ships the output projection unquantized, with no
+    # head.scale beside it -- the same class as embed.weight.
+    g.plain("head.weight", (V, D), scale=0.05)
     g.plain("hc_head_fn", (HC, HC * D), scale=0.1)
     g.plain("hc_head_base", (HC,), scale=0.5)
     g.plain("hc_head_scale", (1,), scale=0.5)
