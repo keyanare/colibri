@@ -560,6 +560,12 @@ tests/bench_topp$(EXE): tests/bench_topp.c colibri.c st.h uring.h json.h tok.h t
 tests/bench_mxfp4$(EXE): tests/bench_mxfp4.c quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# bench_fp8 is a microbenchmark (current scalar matmul_fp8 vs a hand-written NEON
+# variant), NOT a test gate -- intentionally absent from TEST_BINS. Build on demand:
+# make tests/bench_fp8 ARCH=native
+tests/bench_fp8$(EXE): tests/bench_fp8.c quant.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_sample_nan$(EXE): tests/test_sample_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

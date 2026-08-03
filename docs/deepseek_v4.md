@@ -299,17 +299,23 @@ Three real defects were caught this way, which is the argument for the harness:
    `vqtbl1q_s8` and un-doubles through the group scale — the same shape as the
    AVX2 branch, base NEON only (no DOTPROD/i8mm), pinned by an independent
    scalar reference in `test_dsv4.c` (rel-L2 1e-5).
-2. **Batched expert I/O** — one `pread` per expert instead of six, `O_DIRECT`,
+2. ✅ **NEON `matmul_fp8`** — done (2026-08-03). The FP8 dense kernel (attention,
+   projections, head) had no SIMD at all; it now has a NEON path that breaks the
+   serial scalar `acc+=` chain with four independent f32 lanes (clang cannot
+   auto-vectorize the `E4M3_LUT` gather), same exact LUT so NaN propagation is
+   unchanged. Benchmarked ~2.1–2.75× over the scalar `-mcpu=native` build at
+   dense shapes (`tests/bench_fp8`, not a gate).
+3. **Batched expert I/O** — one `pread` per expert instead of six, `O_DIRECT`,
    and overlap with compute. `colibri.c` and `kimi_k3.c` already do all three.
    Chunked prefill made the reads dedupe; it did not make each one cheaper.
-3. **Keep the unquantized tensors bf16 in RAM.** `head.weight` alone is 1.06 GB
+4. **Keep the unquantized tensors bf16 in RAM.** `head.weight` alone is 1.06 GB
    on disk and 2.1 GB resident, because the PLAIN role expands everything to
    f32 at load. Together with the compressor projections that is ~3.5 GB held
    at twice the necessary width — the difference between fitting and swapping
    on a 16 GB machine.
-4. **Exact prefetch on the hash layers** — the one place in this repository where
+5. **Exact prefetch on the hash layers** — the one place in this repository where
    the working set is knowable in advance.
-5. **A token-exact oracle** on the real checkpoint. Everything above is
+6. **A token-exact oracle** on the real checkpoint. Everything above is
    provisional until this exists.
 
 ---

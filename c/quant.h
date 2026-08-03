@@ -567,7 +567,32 @@ static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float 
             for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
                 int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
                 float sc=scl[bi]; float acc=0;
+#if defined(__ARM_NEON)
+                /* Four independent f32 lanes + 4-wide FMA break the serial scalar
+                 * acc+= chain that clang cannot auto-vectorize -- the E4M3_LUT
+                 * gather (an index load per byte) is what stops it. Same exact LUT
+                 * and therefore the same NaN propagation; measured ~2-3x over the
+                 * scalar build at dense (S=1) shapes. The block result is still
+                 * scaled by sc and added to the double `a`, as the scalar path. */
+                float32x4_t ac0=vdupq_n_f32(0),ac1=vdupq_n_f32(0),
+                            ac2=vdupq_n_f32(0),ac3=vdupq_n_f32(0);
+                int iw=base;
+                for(; iw+16<=base+blen; iw+=16){
+                    const uint8_t *wv=w+iw; const float *xv=xs+iw;
+                    float32x4_t f0=(float32x4_t){E4M3_LUT[wv[0]],E4M3_LUT[wv[1]],E4M3_LUT[wv[2]],E4M3_LUT[wv[3]]};
+                    float32x4_t f1=(float32x4_t){E4M3_LUT[wv[4]],E4M3_LUT[wv[5]],E4M3_LUT[wv[6]],E4M3_LUT[wv[7]]};
+                    float32x4_t f2=(float32x4_t){E4M3_LUT[wv[8]],E4M3_LUT[wv[9]],E4M3_LUT[wv[10]],E4M3_LUT[wv[11]]};
+                    float32x4_t f3=(float32x4_t){E4M3_LUT[wv[12]],E4M3_LUT[wv[13]],E4M3_LUT[wv[14]],E4M3_LUT[wv[15]]};
+                    ac0=vfmaq_f32(ac0,vld1q_f32(xv),   f0);
+                    ac1=vfmaq_f32(ac1,vld1q_f32(xv+4), f1);
+                    ac2=vfmaq_f32(ac2,vld1q_f32(xv+8), f2);
+                    ac3=vfmaq_f32(ac3,vld1q_f32(xv+12),f3);
+                }
+                acc=vaddvq_f32(vaddq_f32(vaddq_f32(ac0,ac1),vaddq_f32(ac2,ac3)));
+                for(;iw<base+blen;iw++) acc += e4m3_decode(w[iw])*xs[iw];
+#else
                 for(int i=base;i<base+blen;i++) acc += e4m3_decode(w[i])*xs[i];
+#endif
                 a += (double)acc*sc;
             }
             y[(int64_t)s*O+o]=(float)a;

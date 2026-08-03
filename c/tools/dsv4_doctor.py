@@ -416,7 +416,9 @@ def main():
     if "avx2" in flags:
         r.add(OK, "AVX2 present", "matmul_mxfp4 uses its vector path (build with ARCH=native)")
     elif "neon" in flags:
-        r.add(OK, "NEON present", "matmul_mxfp4 uses its NEON path (I%32==0, every DSV4 expert)")
+        r.add(OK, "NEON present",
+              "matmul_mxfp4 and matmul_fp8 both take a NEON path on ARM64 (every DSV4 expert "
+              "and the FP8 dense tensors); matmul_fp8 has no SIMD on x86")
     else:
         r.add(WARN, "no AVX2/NEON detected", "expert matmuls will run scalar")
     omp_ok = True
