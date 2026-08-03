@@ -970,7 +970,8 @@ static void forward(Model *m, int token_id, int pos){
  *
  * The head is skipped. Prefill needs no logits, and head.weight is the largest
  * dense matmul in the model. */
-static void prefill_chunk(Model *m, const int *ids, int pos0, int C){
+static void prefill_chunk(Model *m, const int *ids, int pos0, int C,
+                          int total, double t0){
     const DSV4Cfg *c=&m->c;
     int HC=c->hc_mult, D=c->dim, K=c->n_activated_experts;
     int E=c->n_routed_experts, MI=c->moe_inter_dim;
@@ -1005,6 +1006,14 @@ static void prefill_chunk(Model *m, const int *ids, int pos0, int C){
     for(int l=0;l<c->n_layers;l++){
         Layer *L=&m->L[l];
         float pre[DSV4_HC_MAX];
+        /* Per LAYER, not per chunk: a chunk of 128 is ~5 minutes of silence
+         * otherwise, which reads as a hang -- and was reported as one. */
+        if(g_verbose){
+            double frac=((double)pos0+(double)C*l/c->n_layers)/(double)total;
+            double el=now_s()-t0;
+            fprintf(stderr,"\r  prefill %d/%d tokens · layer %d/%d · %.0fs elapsed, ~%.0fs left    ",
+                    pos0,total,l+1,c->n_layers,el, frac>0 ? el/frac-el : 0.0);
+        }
 
         /* attention sublayer -- token order, because every piece of state here
          * (the kv ring, the compressor window, the indexer) is a recurrence. */
@@ -1339,14 +1348,12 @@ int main(int argc, char **argv){
         fprintf(stderr,"  prompt: %d tokens, prefill in chunks of %d\n",n_ids,g_chunk);
     while(pos<n_ids-1){
         int cc=n_ids-1-pos; if(cc>g_chunk) cc=g_chunk;
-        prefill_chunk(&m,ids+pos,pos,cc);
+        prefill_chunk(&m,ids+pos,pos,cc,n_ids-1,t0);
         pos+=cc;
-        if(g_verbose){
-            int done=pos, total=n_ids-1;
-            double el=now_s()-t0, rate=el/done;
-            fprintf(stderr,"\r  prefill %d/%d (%.0f%%)  %.0fs elapsed, ~%.0fs left      ",
-                    done,total,100.0*done/total,el,rate*(total-done));
-        }
+    }
+    if(g_verbose && n_ids>1){
+        double el=now_s()-t0;
+        fprintf(stderr,"\r  prefill %d/%d tokens · done in %.0fs%20s",n_ids-1,n_ids-1,el,"");
     }
     tok=ids[n_ids-1];
     if(g_verbose && n_ids>1) fprintf(stderr,"\n");

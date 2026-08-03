@@ -80,3 +80,10 @@ c/tiny_inkling/
 
 # Claude Code working directory (agent worktrees, session scratch) — never a repo artifact
 .claude/
+
+# local ssh keys — never commit
+lecoc
+lecoc.pub
+id_ed25519*
+id_rsa*
+*.pem
