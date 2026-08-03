@@ -79,6 +79,12 @@
 
 /* ------------------------------------------------------------------ knobs */
 static int   g_ngen        = 128;
+/* Prefill chunk: how many prompt tokens share one pass of expert reads.
+ * 32 matches kimi_k3's K3_CHUNK default. 1 restores the token-at-a-time path,
+ * which is the fallback if batching is ever suspected -- results are identical
+ * either way, only the read pattern differs. Bounded because the staging
+ * buffers scale with it (chunk * topk * dim floats). */
+static int   g_chunk       = 32;
 static float g_temp        = 0.0f;    /* 0 = greedy */
 static float g_expert_gb   = 2.0f;    /* GLOBAL streamed-expert cache budget.
                                        * Deliberately a byte budget shared by
@@ -938,6 +944,160 @@ static void forward(Model *m, int token_id, int pos){
     w_matmul(&m->head,m->logits,m->hn,1);
 }
 
+/* ----------------------------------------------------------------- prefill
+ * A CHUNK of C prompt tokens through the stack, LAYER-MAJOR: the MoE loads each
+ * unique expert once and applies it to every token in the chunk that routed to
+ * it. Same shape as kimi_k3.c's step_chunk.
+ *
+ * WHY. forward() walks one token through all 43 layers, so a token's six
+ * experts per layer are read for that token alone: ~3.4 GB per PROMPT token,
+ * and a 197-token prompt spent 744 s here with nothing on stdout. Every token
+ * of the prompt passes through the same weights, so inverting the loops lets
+ * one read serve every token that wanted it. The ceiling is 256 reads per layer
+ * per chunk (the whole expert grid) no matter how long the chunk is.
+ *
+ * BIT-IDENTICAL to the token-at-a-time path, deliberately:
+ *   - the sequential state (kv ring, the compressor's rolling window, the
+ *     indexer's cache) still advances ONE TOKEN AT A TIME inside each layer,
+ *     which is exactly the original order;
+ *   - the dense matmuls still run at S=1 rather than batching over the chunk;
+ *   - each token's expert contributions are STAGED per slot and summed in route
+ *     order, not in the expert-major order they were computed in.
+ * The last one costs C*K*dim floats and buys the property that this is a pure
+ * I/O reordering -- which makes the numpy oracle a real regression check on it
+ * instead of an approximate one. Batching the dense matmuls is the next step
+ * and is NOT free in that sense: it changes reduction order.
+ *
+ * The head is skipped. Prefill needs no logits, and head.weight is the largest
+ * dense matmul in the model. */
+static void prefill_chunk(Model *m, const int *ids, int pos0, int C){
+    const DSV4Cfg *c=&m->c;
+    int HC=c->hc_mult, D=c->dim, K=c->n_activated_experts;
+    int E=c->n_routed_experts, MI=c->moe_inter_dim;
+    size_t hcD=(size_t)HC*D;
+
+    float *X   =(float*)xalloc((size_t)C*hcD*sizeof(float),"prefill streams");
+    float *XRES=(float*)xalloc((size_t)C*hcD*sizeof(float),"prefill residual");
+    float *HN  =(float*)xalloc((size_t)C*D*sizeof(float),  "prefill normed");
+    float *POST=(float*)xalloc((size_t)C*DSV4_HC_MAX*sizeof(float),"prefill post");
+    float *COMB=(float*)xalloc((size_t)C*DSV4_HC_MAX*DSV4_HC_MAX*sizeof(float),"prefill comb");
+    float *ESTG=(float*)xalloc((size_t)C*K*D*sizeof(float),"prefill expert staging");
+    int   *IDX =(int*)  xalloc((size_t)C*K*sizeof(int),  "prefill route idx");
+    float *WT  =(float*)xalloc((size_t)C*K*sizeof(float),"prefill route wt");
+    int   *NSEL=(int*)  xalloc((size_t)C*sizeof(int),    "prefill route n");
+    float *logits=(float*)xalloc((size_t)E*sizeof(float),"router logits");
+    /* counting sort over (token,slot) -> expert */
+    int *map    =(int*)xalloc((size_t)E*sizeof(int),    "expert map");
+    int *uid    =(int*)xalloc((size_t)C*K*sizeof(int),  "unique experts");
+    int *pcnt   =(int*)xalloc((size_t)C*K*sizeof(int),  "expert counts");
+    int *pfirst =(int*)xalloc((size_t)C*K*sizeof(int),  "expert heads");
+    int *cur    =(int*)xalloc((size_t)C*K*sizeof(int),  "expert cursors");
+    int *poslist=(int*)xalloc((size_t)C*K*sizeof(int),  "expert token list");
+    int *slotlist=(int*)xalloc((size_t)C*K*sizeof(int), "expert slot list");
+
+    for(int t=0;t<C;t++){
+        if(ids[t]<0||ids[t]>=c->vocab_size){
+            fprintf(stderr,"token id %d outside [0,%d)\n",ids[t],c->vocab_size); exit(1); }
+        st_read_slice_f32(&m->S,"embed.weight",(int64_t)ids[t]*D,D,m->embrow,0);
+        for(int j=0;j<HC;j++) memcpy(X+(size_t)t*hcD+(size_t)j*D,m->embrow,(size_t)D*sizeof(float));
+    }
+
+    for(int l=0;l<c->n_layers;l++){
+        Layer *L=&m->L[l];
+        float pre[DSV4_HC_MAX];
+
+        /* attention sublayer -- token order, because every piece of state here
+         * (the kv ring, the compressor window, the indexer) is a recurrence. */
+        for(int t=0;t<C;t++){
+            float *x=X+(size_t)t*hcD;
+            float post[DSV4_HC_MAX], comb[DSV4_HC_MAX*DSV4_HC_MAX];
+            memcpy(m->xres,x,hcD*sizeof(float));
+            dsv4_hc_pre(x,HC,D,L->hc_attn_fn.f,L->hc_attn_scale.f,L->hc_attn_base.f,
+                        c->hc_sinkhorn_iters,c->hc_eps,c->norm_eps,m->h,pre,post,comb);
+            rmsnorm(m->hn,m->h,L->attn_norm.f,D,c->norm_eps);
+            attention(m,L,m->hn,pos0+t,m->h);
+            dsv4_hc_post(m->h,m->xres,post,comb,HC,D,x);
+        }
+
+        /* FFN sublayer, phase 1: normalize and ROUTE every token, so the expert
+         * working set of the whole chunk is known before a single read. */
+        for(int t=0;t<C;t++){
+            float *x=X+(size_t)t*hcD;
+            memcpy(XRES+(size_t)t*hcD,x,hcD*sizeof(float));
+            dsv4_hc_pre(x,HC,D,L->hc_ffn_fn.f,L->hc_ffn_scale.f,L->hc_ffn_base.f,
+                        c->hc_sinkhorn_iters,c->hc_eps,c->norm_eps,m->h,pre,
+                        POST+(size_t)t*DSV4_HC_MAX,
+                        COMB+(size_t)t*DSV4_HC_MAX*DSV4_HC_MAX);
+            rmsnorm(HN+(size_t)t*D,m->h,L->ffn_norm.f,D,c->norm_eps);
+            w_matmul(&L->gate_w,logits,HN+(size_t)t*D,1);
+            if(L->hash){
+                const int32_t *row=L->tid2eid.i32+(size_t)ids[t]*K;
+                NSEL[t]=dsv4_route_hash(logits,row,K,c->norm_topk,c->route_scale,
+                                        IDX+(size_t)t*K,WT+(size_t)t*K);
+            } else {
+                NSEL[t]=dsv4_route(logits,L->gate_bias.f,E,K,c->norm_topk,c->route_scale,
+                                   IDX+(size_t)t*K,WT+(size_t)t*K);
+            }
+        }
+
+        /* phase 2: bucket (token,slot) pairs by expert, then walk expert-major. */
+        for(int e=0;e<E;e++) map[e]=-1;
+        int nu=0;
+        for(int t=0;t<C;t++) for(int k=0;k<NSEL[t];k++){
+            int e=IDX[(size_t)t*K+k];
+            if(map[e]<0){ map[e]=nu; uid[nu]=e; pcnt[nu]=0; nu++; }
+            pcnt[map[e]]++;
+        }
+        int acc=0;
+        for(int j=0;j<nu;j++){ pfirst[j]=acc; cur[j]=acc; acc+=pcnt[j]; }
+        for(int t=0;t<C;t++) for(int k=0;k<NSEL[t];k++){
+            int j=map[IDX[(size_t)t*K+k]];
+            poslist[cur[j]]=t; slotlist[cur[j]]=k; cur[j]++;
+        }
+        for(int j=0;j<nu;j++){
+            W *w1,*w3,*w2;
+            expert_get(m,l,uid[j],&w1,&w3,&w2);   /* ONE read for pcnt[j] tokens */
+            for(int q=pfirst[j];q<pfirst[j]+pcnt[j];q++){
+                int t=poslist[q], k=slotlist[q];
+                const float *xin=HN+(size_t)t*D;
+                w_matmul(w1,m->ffn_g,xin,1);
+                w_matmul(w3,m->ffn_u,xin,1);
+                dsv4_swiglu(m->ffn_g,m->ffn_g,m->ffn_u,MI,c->swiglu_limit);
+                float wt=WT[(size_t)t*K+k];
+                for(int i=0;i<MI;i++) m->ffn_g[i]*=wt;
+                w_matmul(w2,ESTG+((size_t)t*K+k)*D,m->ffn_g,1);
+            }
+        }
+
+        /* phase 3: sum in ROUTE order (see the bit-identical note), add the
+         * shared expert -- resident, so no ordering pressure -- and expand. */
+        for(int t=0;t<C;t++){
+            float *out=m->h;
+            memset(out,0,(size_t)D*sizeof(float));
+            for(int k=0;k<NSEL[t];k++){
+                const float *e=ESTG+((size_t)t*K+k)*D;
+                for(int d=0;d<D;d++) out[d]+=e[d];
+            }
+            if(c->n_shared_experts){
+                const float *xin=HN+(size_t)t*D;
+                w_matmul(&L->sh_w1,m->ffn_g,xin,1);
+                w_matmul(&L->sh_w3,m->ffn_u,xin,1);
+                dsv4_swiglu(m->ffn_g,m->ffn_g,m->ffn_u,MI,c->swiglu_limit);
+                w_matmul(&L->sh_w2,m->ffn_o,m->ffn_g,1);
+                for(int d=0;d<D;d++) out[d]+=m->ffn_o[d];
+            }
+            dsv4_hc_post(out,XRES+(size_t)t*hcD,
+                         POST+(size_t)t*DSV4_HC_MAX,
+                         COMB+(size_t)t*DSV4_HC_MAX*DSV4_HC_MAX,HC,D,X+(size_t)t*hcD);
+        }
+    }
+
+    free(X); free(XRES); free(HN); free(POST); free(COMB); free(ESTG);
+    free(IDX); free(WT); free(NSEL); free(logits);
+    free(map); free(uid); free(pcnt); free(pfirst); free(cur);
+    free(poslist); free(slotlist);
+}
+
 /* ---------------------------------------------------------------- sampling */
 
 static int sample(Model *m){
@@ -1111,6 +1271,7 @@ static void usage(const char *p){
       "usage: %s <model_dir> \"prompt\" [--ngen N] [--temp T] [--expert-gb G] [--max-seq N]\n"
       "       %s <model_dir> \"3,7,1\" --ids [--dump-logits out.json]   (oracle mode, no tokenizer)\n"
       "       %s <model_dir> --preflight     (check names and shapes, read no weights)\n"
+      "  --chunk N: prefill tokens per pass of expert reads (default 32, 1 = per-token)\n"
       "  DeepSeek-V4-Flash (284B MoE, 13B active). UNVERIFIED -- see the header comment.\n",p,p,p);
 }
 
@@ -1123,6 +1284,7 @@ int main(int argc, char **argv){
         else if(!strcmp(argv[i],"--temp")  && i+1<argc) g_temp=(float)atof(argv[++i]);
         else if(!strcmp(argv[i],"--expert-gb")&&i+1<argc) g_expert_gb=(float)atof(argv[++i]);
         else if(!strcmp(argv[i],"--max-seq")&&i+1<argc) g_max_seq=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--chunk")  &&i+1<argc) g_chunk=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--quiet")) g_verbose=0;
         else if(!strcmp(argv[i],"--ids")) g_ids_mode=1;
         else if(!strcmp(argv[i],"--preflight")) g_preflight=1;
@@ -1131,6 +1293,8 @@ int main(int argc, char **argv){
     }
     if(g_expert_gb<=0.0f) g_expert_gb=0.25f;
     if(g_max_seq<64) g_max_seq=64;
+    if(g_chunk<1) g_chunk=1;
+    if(g_chunk>512) g_chunk=512;
 #ifdef _OPENMP
     coli_omp_tune_threads("deepseek_v4");   /* physical-core team, no spin-wait — see omp_tune.h */
 #endif
@@ -1172,16 +1336,19 @@ int main(int argc, char **argv){
      * before the first output character. Silence there is indistinguishable
      * from a hang, and was reported as one, hence the progress line. */
     if(g_verbose && n_ids>1)
-        fprintf(stderr,"  prompt: %d tokens (prefill is one forward pass each)\n",n_ids);
-    for(;pos<n_ids-1;pos++){
-        forward(&m,ids[pos],pos); tok=ids[pos+1];
-        if(g_verbose && (pos%4==0 || pos==n_ids-2)){
-            int done=pos+1, total=n_ids-1;
+        fprintf(stderr,"  prompt: %d tokens, prefill in chunks of %d\n",n_ids,g_chunk);
+    while(pos<n_ids-1){
+        int cc=n_ids-1-pos; if(cc>g_chunk) cc=g_chunk;
+        prefill_chunk(&m,ids+pos,pos,cc);
+        pos+=cc;
+        if(g_verbose){
+            int done=pos, total=n_ids-1;
             double el=now_s()-t0, rate=el/done;
             fprintf(stderr,"\r  prefill %d/%d (%.0f%%)  %.0fs elapsed, ~%.0fs left      ",
                     done,total,100.0*done/total,el,rate*(total-done));
         }
     }
+    tok=ids[n_ids-1];
     if(g_verbose && n_ids>1) fprintf(stderr,"\n");
     /* Prefill and decode are different regimes -- one is N forward passes with
      * no output, the other is one per token -- and averaging them reported

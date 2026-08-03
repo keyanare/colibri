@@ -206,6 +206,7 @@ tensors it does not cover (the MTP head) as expected rather than as corruption.
 | `--temp T` | 0 = greedy (default) |
 | `--ids` | treat the prompt as comma-separated token ids; skips the tokenizer |
 | `--dump-logits F` | write per-step logits — the oracle path |
+| `--chunk N` | prefill tokens per pass of expert reads (default 32, 1 = per-token) |
 | `--preflight` | check names and shapes against the manifest, read no weights |
 
 `dsv4_doctor.py` suggests an `--expert-gb` that fits your RAM.
@@ -232,13 +233,20 @@ They land in the same place for different reasons: the Mac has a faster SSD but
 a cache too small to help; the PC has a usable cache but half the bandwidth.
 Neither has a GPU path — **there is no CUDA or Metal backend for this engine.**
 
-Prefill runs one token at a time, so a 197-token prompt cost **12 minutes**
-before the first generated character — each prompt token is a full forward pass
-with the same ~3.4 GB of expert reads as a generated one. The engine prints
-progress and an estimate so the wait is legible, but the fix is batching: all
-prompt tokens pass through the SAME expert weights, so an expert read once and
-applied to every token that routed to it turns prefill from I/O-bound into
-compute-bound. Nothing in the design prevents it.
+Prefill runs **layer-major over chunks of `--chunk` tokens** (default 32), so
+each unique expert is read once per layer per chunk and applied to every token
+that routed to it. Token-at-a-time cost 3.8 s/token — 12 minutes for a
+197-token prompt — because a token's six experts per layer were read for that
+token alone. The ceiling is now 256 reads per layer per chunk however long the
+chunk is, and the head is skipped for prompt tokens.
+
+The batching is **bit-identical** to `--chunk 1`, on purpose: the sequential
+state still advances one token at a time inside each layer, the dense matmuls
+still run at S=1, and each token's expert contributions are staged and summed
+in route order rather than in the expert-major order they were computed in.
+`test_prefill_chunking_is_bit_identical` compares the logit dumps byte-for-byte
+across chunk sizes. Batching the dense matmuls too is the next step, and it is
+not free in that sense — it changes reduction order.
 
 ---
 
@@ -289,6 +297,7 @@ Three real defects were caught this way, which is the argument for the harness:
    is the hot loop. `quant.h` already has NEON idioms next to it.
 2. **Batched expert I/O** — one `pread` per expert instead of six, `O_DIRECT`,
    and overlap with compute. `colibri.c` and `kimi_k3.c` already do all three.
+   Chunked prefill made the reads dedupe; it did not make each one cheaper.
 3. **Keep the unquantized tensors bf16 in RAM.** `head.weight` alone is 1.06 GB
    on disk and 2.1 GB resident, because the PLAIN role expands everything to
    f32 at load. Together with the compressor projections that is ~3.5 GB held

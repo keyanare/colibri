@@ -59,6 +59,38 @@ class TinyDsv4Oracle(unittest.TestCase):
                              f"engine disagrees with the reference:\n{chk.stdout}\n{chk.stderr}")
             self.assertIn("ok", chk.stdout)
 
+    def test_prefill_chunking_is_bit_identical(self):
+        """Batched prefill reorders WHICH TOKEN a weight is read for, and
+        nothing else: sequential state still advances per token inside each
+        layer, dense matmuls stay at S=1, and each token's expert contributions
+        are summed in route order rather than the expert-major order they were
+        computed in.
+
+        So the logits must match to the byte across chunk sizes -- not to a
+        tolerance. A tolerance here would pass a version that quietly changed
+        reduction order, which is the one thing this design pays staging memory
+        to avoid."""
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run([sys.executable, TOOL, d], capture_output=True,
+                           text=True, cwd=CDIR, check=True)
+            ref = None
+            for chunk in ("1", "2", "5", "64"):
+                out = os.path.join(d, f"got{chunk}.json")
+                r = subprocess.run([ENGINE, d, IDS, "--ids", "--ngen", "2",
+                                    "--chunk", chunk, "--dump-logits", out, "--quiet"],
+                                   capture_output=True, text=True, cwd=CDIR)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                with open(out, "rb") as f:
+                    blob = f.read()
+                if ref is None:
+                    ref = blob
+                    # chunk 5 does not divide the 7-token prefill: the last
+                    # chunk is short, which is where an off-by-one would live
+                    self.assertGreater(len(ref), 0)
+                else:
+                    self.assertEqual(blob, ref,
+                                     f"--chunk {chunk} changed the logits")
+
     def test_fixture_exercises_every_layer_class(self):
         """The fixture is only a gate if it reaches the branches that differ.
         Layer 0 must be sliding-window-only AND hash-routed; layer 1 must own a
