@@ -1166,8 +1166,23 @@ int main(int argc, char **argv){
 
     double t0=now_s();
     int pos=0, tok=ids[0];
-    /* Prefill, one token at a time (see the header's known gaps). */
-    for(;pos<n_ids-1;pos++){ forward(&m,ids[pos],pos); tok=ids[pos+1]; }
+    /* Prefill, one token at a time (see the header's known gaps). Each prompt
+     * token costs a FULL forward pass -- the same ~3.4 GB of expert reads as a
+     * generated one -- so a few hundred tokens of prompt is tens of minutes
+     * before the first output character. Silence there is indistinguishable
+     * from a hang, and was reported as one, hence the progress line. */
+    if(g_verbose && n_ids>1)
+        fprintf(stderr,"  prompt: %d tokens (prefill is one forward pass each)\n",n_ids);
+    for(;pos<n_ids-1;pos++){
+        forward(&m,ids[pos],pos); tok=ids[pos+1];
+        if(g_verbose && (pos%4==0 || pos==n_ids-2)){
+            int done=pos+1, total=n_ids-1;
+            double el=now_s()-t0, rate=el/done;
+            fprintf(stderr,"\r  prefill %d/%d (%.0f%%)  %.0fs elapsed, ~%.0fs left      ",
+                    done,total,100.0*done/total,el,rate*(total-done));
+        }
+    }
+    if(g_verbose && n_ids>1) fprintf(stderr,"\n");
 
     char piece[512];
     int gen=0, hit_stop=0;
