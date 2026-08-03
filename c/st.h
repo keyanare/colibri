@@ -82,6 +82,16 @@ static int st_dtype_code(const char *s, const char *file, const char *name) {
     if (!strcmp(s, "F32"))  return 2;
     if (!strcmp(s, "U8"))   return 3;   /* dati quantizzati (int4 packed / int8) */
     if (!strcmp(s, "I8"))   return 3;
+    /* F8_E4M3: fp8 WEIGHT bytes as a real checkpoint declares them. colibri's
+     * own containers spell the identical layout U8, which is why this was
+     * missing until a published fp8 checkpoint was read. One byte per element,
+     * decoded downstream by matmul_fp8 -- raw-byte class.
+     *
+     * DELIBERATELY NOT F8_E5M2. It is also one byte per element, so it would
+     * land in this same class and be decoded by an e4m3 kernel: a silent
+     * misread of every weight. Refusing it by name is the correct outcome
+     * until something actually decodes it. */
+    if (!strcmp(s, "F8_E4M3")) return 3;
     /* F8_E8M0: the ue8m0 block-scale sidecar dtype (DeepSeek-V4's fp8-e4m3-b128
      * checkpoints declare their scale arrays this way). One byte per element and
      * opaque to this layer -- the exponent is decoded downstream by

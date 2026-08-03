@@ -174,6 +174,17 @@ class Preflight(unittest.TestCase):
                 outs.append(json.load(f))
         self.assertEqual(outs[0], outs[1])
 
+    def test_u8_spelling_of_fp8_weights_still_loads(self):
+        """The fixture declares fp8 weights F8_E4M3, like the real checkpoint.
+        colibri's OWN containers spell the identical layout U8, and both must
+        keep loading -- the byte count is the same, only the label differs."""
+        def relabel(h):
+            h["layers.0.attn.wkv.weight"]["dtype"] = "U8"
+        d = self.variant("u8fp8", relabel)
+        r = self.run_preflight(d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("PREFLIGHT OK", r.stderr)
+
     def test_unsupported_dtype_names_the_tensor(self):
         """st_init walks EVERY tensor in the container, including ones the
         manifest never covers, so a dtype it cannot read must say which tensor

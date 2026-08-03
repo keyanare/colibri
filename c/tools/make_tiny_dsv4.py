@@ -98,7 +98,11 @@ class Gen:
         b[(b == 0x7F) | (b == 0xFF)] = 0x10          # drop NaN codes
         nbO, nbI = (O + 127) // 128, (I + 127) // 128
         e = self.rng.integers(120, 135, size=(nbO, nbI), dtype=np.uint8)
-        self._put(name, "U8", (O, I), b.tobytes())
+        # F8_E4M3, not U8: the published checkpoint declares its fp8 weights
+        # that way, and the fixture exists to be the real on-disk format. The
+        # bytes are identical either way -- what this exercises is st.h's dtype
+        # table, which had no entry for it until a real checkpoint was read.
+        self._put(name, "F8_E4M3", (O, I), b.tobytes())
         self._put(name + ".scale", "F8_E8M0", (nbO, nbI), e.tobytes())
         s = ue8m0(e)
         w = E4M3[b] * np.repeat(np.repeat(s, 128, 0), 128, 1)[:O, :I]
