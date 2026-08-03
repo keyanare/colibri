@@ -72,7 +72,11 @@ static uint64_t st_hash(const char *s){
     return h;
 }
 
-static int st_dtype_code(const char *s) {
+/* `file` and `name` are for the refusal message only. They are not optional:
+ * st_init walks EVERY tensor in the container, including ones the caller's
+ * manifest never touches, so "unsupported dtype: I64" with no subject sends the
+ * reader looking through 34k tensors for the one that stopped the load. */
+static int st_dtype_code(const char *s, const char *file, const char *name) {
     if (!strcmp(s, "BF16")) return 0;
     if (!strcmp(s, "F16"))  return 1;
     if (!strcmp(s, "F32"))  return 2;
@@ -89,7 +93,14 @@ static int st_dtype_code(const char *s) {
      * dtype-3 branch skips the numel*esz check that would reject 4-byte
      * elements. Read with st_read_raw and cast by the caller. */
     if (!strcmp(s, "I32")) return 3;
-    fprintf(stderr, "unsupported dtype: %s\n", s); exit(1);
+    /* I64: torch's default for index tensors, so a checkpoint's side tables
+     * arrive this way unless the exporter narrowed them. Same raw-byte class --
+     * this layer stores the byte span and nothing else. A CONSUMER MUST CHECK
+     * THE WIDTH: st_read_raw copies nbytes into a buffer the caller sized from
+     * the config, so reading an I64 table as if it were I32 overruns it by 2x.
+     * dsv4's w_load is the worked example. */
+    if (!strcmp(s, "I64")) return 3;
+    fprintf(stderr, "%s: tensor '%s' has unsupported dtype: %s\n", file, name, s); exit(1);
 }
 
 static inline float bf16_to_f32(uint16_t h) {
@@ -511,7 +522,7 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
             }
             st_tensor *t = &S->t[S->n++];
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
-            t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
+            t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str, files[fi], name); t->numel = numel;
             /* cross-check the declared element count against the byte span for FLOAT
              * dtypes: st_read_f32 writes `numel` floats (BF16/F16 loop or F32 memcpy)
              * into a caller-sized buffer, so a header with numel != nbytes/esz is an

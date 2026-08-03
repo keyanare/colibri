@@ -72,8 +72,13 @@ c/tests/test_tok_dsv4.c         tok.h vs HF tokenizers harness
 ```
 
 Changes to shared code: `quant.h` gained a UE8M0 block-scale decoder,
-`st.h` learned the `F8_E8M0` and `I32` dtypes and `tok.h` gained a fourth
+`st.h` learned the `F8_E8M0`, `I32` and `I64` dtypes and `tok.h` gained a fourth
 pre-tokenizer family plus support for string-form `merges`.
+
+`I64` is there because torch's default dtype for an index tensor is int64, so
+the `tid2eid` hash tables arrive 8 bytes wide. `st.h` treats them as opaque
+bytes; `w_load` settles the width and narrows, and refuses any other byte span
+rather than reading a routing table half-wrong.
 
 ---
 

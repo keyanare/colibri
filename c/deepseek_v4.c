@@ -214,9 +214,33 @@ static int w_load(shards *S, const DSV4Tensor *t, W *w, int required){
         w->e8=(uint8_t*)xalloc((size_t)ng,"mxfp4 scales");
         st_read_raw(S,sn,w->e8,0);
     } else if(t->role==DSV4_T_I32){
-        int64_t n=w->O*w->I;
+        /* The hash table is an INDEX tensor, and torch's default index dtype is
+         * int64 -- so it arrives 8 bytes wide unless the exporter narrowed it.
+         * st_read_raw copies the tensor's own byte span into this buffer, which
+         * is sized from the config, so the width must be settled BEFORE the
+         * read: at 8 bytes/entry an unchecked read overruns by exactly 2x.
+         * Both widths are accepted and narrowed here; every other span is a
+         * refusal, because a table half-read is a routing table that silently
+         * sends tokens to the wrong experts. */
+        int64_t n=w->O*w->I, nb=st_nbytes(S,t->name);
         w->i32=(int32_t*)xalloc((size_t)n*4,"hash table");
-        st_read_raw(S,t->name,w->i32,0);
+        if(nb==n*4){
+            st_read_raw(S,t->name,w->i32,0);
+        } else if(nb==n*8){
+            int64_t *raw=(int64_t*)xalloc((size_t)n*8,"i64 hash staging");
+            st_read_raw(S,t->name,raw,0);
+            for(int64_t i=0;i<n;i++){
+                int64_t v=raw[i];
+                if(v<INT32_MIN || v>INT32_MAX){
+                    fprintf(stderr,"%s: entry %lld is %lld, not representable as int32\n",
+                            t->name,(long long)i,(long long)v); exit(1); }
+                w->i32[i]=(int32_t)v;
+            }
+            free(raw);
+        } else {
+            fprintf(stderr,"%s: %lld bytes for %lld entries — expected %lld (int32) or %lld (int64)\n",
+                    t->name,(long long)nb,(long long)n,(long long)(n*4),(long long)(n*8)); exit(1);
+        }
     } else {
         int64_t n=w->O*w->I;
         w->f=(float*)xalloc((size_t)n*sizeof(float),"plain weights");
@@ -476,6 +500,15 @@ static void model_load(Model *m, const char *dir){
             t.d0=c->vocab_size; t.d1=c->n_activated_experts;
             snprintf(t.name,sizeof t.name,"layers.%d.ffn.gate.tid2eid",l);
             w_load(&m->S,&t,&L->tid2eid,1);
+            /* w_load settles the WIDTH; the expert grid is only known here. An
+             * out-of-range id indexes the expert array on the hot path, where
+             * it would be an OOB read rather than a wrong answer. */
+            for(int64_t i=0,ne=(int64_t)c->vocab_size*c->n_activated_experts;i<ne;i++){
+                int e=L->tid2eid.i32[i];
+                if(e<0 || e>=c->n_routed_experts){
+                    fprintf(stderr,"layers.%d.ffn.gate.tid2eid[%lld]=%d, outside [0,%d)\n",
+                            l,(long long)i,e,c->n_routed_experts); exit(1); }
+            }
         } else {
             memset(&t,0,sizeof t); t.role=DSV4_T_PLAIN; t.d0=c->n_routed_experts; t.d1=1;
             snprintf(t.name,sizeof t.name,"layers.%d.ffn.gate.bias",l);
@@ -955,6 +988,9 @@ static int preflight(const char *dir){
             if(ss) seen[ss - S.t]=1;
         }
         int64_t want=pf_expect_weight(t);
+        /* An index table is int32 or int64 -- torch's default is the latter and
+         * w_load narrows it -- so both spans are correct here. */
+        if(t->role==DSV4_T_I32 && st->nbytes==want*2) want=st->nbytes;
         if(want>=0 && st->nbytes!=want){
             badsize++; PF_SHOW("  SIZE      %s  %lld bytes, expected %lld for [%lld,%lld]\n",
                 t->name,(long long)st->nbytes,(long long)want,(long long)t->d0,(long long)t->d1);

@@ -51,8 +51,12 @@ class Preflight(unittest.TestCase):
     def tearDownClass(cls):
         cls._tmp.cleanup()
 
-    def variant(self, name, mutate):
-        """A copy of the good fixture with its header mutated in place."""
+    def variant(self, name, mutate, extra=b""):
+        """A copy of the good fixture with its header mutated in place.
+
+        `extra` is appended after the original blob, so a mutation that needs
+        MORE bytes than the tensor it replaces (a widened dtype) can point its
+        data_offsets past the end of the original data."""
         d = os.path.join(self._tmp.name, name)
         os.makedirs(d, exist_ok=True)
         shutil.copy(os.path.join(self.good, "config.json"), os.path.join(d, "config.json"))
@@ -63,6 +67,7 @@ class Preflight(unittest.TestCase):
             f.write(struct.pack("<Q", len(hj)))
             f.write(hj)
             f.write(self.blob)
+            f.write(extra)
         return d
 
     def run_preflight(self, d):
@@ -121,6 +126,68 @@ class Preflight(unittest.TestCase):
         self.assertIn("does not cover", r.stderr)
         self.assertIn("EXPECTED, not an error", r.stderr)
         self.assertIn("mtp.0.attn.wq_a.weight", r.stderr)
+
+    def _widen_tid2eid(self, name):
+        """Rewrite layers.0.ffn.gate.tid2eid as int64 holding the same values,
+        appended past the original blob. Returns the variant directory."""
+        import numpy as np
+        key = "layers.0.ffn.gate.tid2eid"
+        e = self.hdr[key]
+        a, b = e["data_offsets"]
+        vals = np.frombuffer(self.blob[a:b], dtype="<i4").astype("<i8")
+        wide = vals.tobytes()
+
+        def widen(h):
+            h[key]["dtype"] = "I64"
+            h[key]["data_offsets"] = [len(self.blob), len(self.blob) + len(wide)]
+        return self.variant(name, widen, extra=wide)
+
+    def test_i64_index_table_is_not_a_size_error(self):
+        """torch's default dtype for an index tensor is int64, so tid2eid can
+        legitimately arrive 8 bytes wide. Preflight sizes it from the config, so
+        without knowing that it reports a correct table as the wrong size."""
+        d = self._widen_tid2eid("i64tab")
+        r = self.run_preflight(d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("PREFLIGHT OK", r.stderr)
+
+    def test_i64_index_table_loads_to_the_same_routing(self):
+        """The load path narrows int64 -> int32. This is the check that it
+        narrows rather than misreads: same table, same width-independent
+        logits. A 2x byte span read into a 4-byte-per-entry buffer would have
+        overrun it long before the comparison."""
+        d = self._widen_tid2eid("i64run")
+        # the fixture's own weights, minus the header the variant rewrote
+        for f in ("ref_dsv4.json",):
+            src = os.path.join(self.good, f)
+            if os.path.exists(src):
+                shutil.copy(src, os.path.join(d, f))
+        ids, ngen = "3,7,1,5,2,9,4,11", "2"
+        outs = []
+        for where in (self.good, d):
+            dump = os.path.join(where, "logits.json")
+            r = subprocess.run([ENGINE, where, ids, "--ids", "--ngen", ngen,
+                                "--dump-logits", dump, "--quiet"],
+                               capture_output=True, text=True, cwd=CDIR)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with open(dump) as f:
+                outs.append(json.load(f))
+        self.assertEqual(outs[0], outs[1])
+
+    def test_unsupported_dtype_names_the_tensor(self):
+        """st_init walks EVERY tensor in the container, including ones the
+        manifest never covers, so a dtype it cannot read must say which tensor
+        and which shard. The bare 'unsupported dtype: X' it used to print sends
+        the reader hunting through 34k names by hand."""
+        def bad(h):
+            h["mtp.0.markov.state"] = {"dtype": "U64", "shape": [4],
+                                       "data_offsets": [0, 32]}
+        d = self.variant("baddtype", bad)
+        r = self.run_preflight(d)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("mtp.0.markov.state", r.stderr)
+        self.assertIn("U64", r.stderr)
+        self.assertIn("model.safetensors", r.stderr)
 
     def test_missing_tokenizer_is_reported_but_not_fatal(self):
         """The fixture ships no vocabulary, like the real checkpoint. That
