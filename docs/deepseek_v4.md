@@ -305,9 +305,16 @@ Three real defects were caught this way, which is the argument for the harness:
    auto-vectorize the `E4M3_LUT` gather), same exact LUT so NaN propagation is
    unchanged. Benchmarked ~2.1–2.75× over the scalar `-mcpu=native` build at
    dense shapes (`tests/bench_fp8`, not a gate).
-3. **Batched expert I/O** — one `pread` per expert instead of six, `O_DIRECT`,
-   and overlap with compute. `colibri.c` and `kimi_k3.c` already do all three.
-   Chunked prefill made the reads dedupe; it did not make each one cheaper.
+3. ✅ **Batched expert I/O** — done (2026-08-04). One `pread` per expert instead
+   of six: the six byte spans (w1/w3/w2 + their ue8m0 scales) are resolved ONCE
+   into an `ExRef` table at load, a cache-miss overwrites one 4K-aligned slab
+   with a single coalesced pread (or, for the rare expert that straddles a shard
+   boundary, six per-piece preads packed into that same slab). `O_DIRECT` via
+   `--direct` routes the contiguous read through the aligned twin fd; otherwise
+   a `WILLNEED` prefetch overlaps the load with compute (decode and per-chunk
+   prefill, sorted by disk offset). `tools/make_tiny_dsv4.py --gap` breaks one
+   expert's contiguity so the fallback is exercised; pinned by new CI tests
+   (`test_dsv4_fixture.py`, both `--gap` and `--direct`).
 4. **Keep the unquantized tensors bf16 in RAM.** `head.weight` alone is 1.06 GB
    on disk and 2.1 GB resident, because the PLAIN role expands everything to
    f32 at load. Together with the compressor projections that is ~3.5 GB held

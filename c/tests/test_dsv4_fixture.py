@@ -91,6 +91,50 @@ class TinyDsv4Oracle(unittest.TestCase):
                     self.assertEqual(blob, ref,
                                      f"--chunk {chunk} changed the logits")
 
+    def test_gap_fallback_is_bit_identical(self):
+        """--gap parks a PLAIN tensor inside expert 0, so its six on-disk spans
+        are NOT contiguous and the loader must fall back to per-piece preads
+        packed into the same 4K slab. The other experts stay contiguous, so one
+        model exercises BOTH the coalesced single-pread path and the fallback.
+        The engine must produce the same logits (to byte) either way -- the
+        oracle reference is derived from the same on-disk gap layout."""
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run([sys.executable, TOOL, d, "--gap"], capture_output=True,
+                           text=True, cwd=CDIR, check=True)
+            got = os.path.join(d, "got.json")
+            run = subprocess.run([ENGINE, d, IDS, "--ids", "--ngen", str(NGEN),
+                                  "--dump-logits", got, "--quiet"],
+                                 capture_output=True, text=True, cwd=CDIR)
+            self.assertEqual(run.returncode, 0,
+                             f"engine failed on gap fixture:\n{run.stderr}")
+            # --check auto-detects the __gap tensors already on disk.
+            chk = subprocess.run([sys.executable, TOOL, d, "--check", got],
+                                 capture_output=True, text=True, cwd=CDIR)
+            self.assertEqual(chk.returncode, 0,
+                             f"gap fallback disagrees with reference:\n{chk.stdout}\n{chk.stderr}")
+            self.assertIn("ok", chk.stdout)
+
+    def test_direct_reads_match(self):
+        """--direct routes expert reads through the twin O_DIRECT/F_NOCACHE fd
+        with a 4K-aligned window (head slack + tail fetched buffered). That path
+        must read the same bytes as the buffered one -- bypassing the page cache
+        changes speed, never content. On macOS the aligned-window logic and on
+        Linux O_DIRECT are both covered by the same correctness gate."""
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run([sys.executable, TOOL, d], capture_output=True,
+                           text=True, cwd=CDIR, check=True)
+            got = os.path.join(d, "got.json")
+            run = subprocess.run([ENGINE, d, IDS, "--ids", "--ngen", str(NGEN),
+                                  "--direct", "--dump-logits", got, "--quiet"],
+                                 capture_output=True, text=True, cwd=CDIR)
+            self.assertEqual(run.returncode, 0,
+                             f"engine failed under --direct:\n{run.stderr}")
+            chk = subprocess.run([sys.executable, TOOL, d, "--check", got],
+                                 capture_output=True, text=True, cwd=CDIR)
+            self.assertEqual(chk.returncode, 0,
+                             f"--direct disagrees with reference:\n{chk.stdout}\n{chk.stderr}")
+            self.assertIn("ok", chk.stdout)
+
     def test_fixture_exercises_every_layer_class(self):
         """The fixture is only a gate if it reaches the branches that differ.
         Layer 0 must be sliding-window-only AND hash-routed; layer 1 must own a

@@ -106,6 +106,14 @@ static int   g_verbose     = 1;
 static int   g_preflight   = 0;      /* --preflight: check the checkpoint, load nothing */
 static int   g_ids_mode    = 0;      /* --ids: token ids given directly, no tokenizer */
 static const char *g_dump  = NULL;   /* --dump-logits: oracle output for the fixture */
+/* --direct: route expert reads through the twin O_DIRECT / F_NOCACHE fd
+ * (st_direct_fd), bypassing the page cache. OFF by default: it is drive-
+ * dependent (README: "measure DIRECT=1") and the coalesced read ALIGNS its
+ * window so the Linux/Windows direct contract is honoured, but with no way to
+ * A/B it here it stays a measured lever, not a promise. When OFF the WILLNEED
+ * prefetch (overlap) is active; with --direct there is no page cache to warm,
+ * exactly like kimi_k3.c's K3_DIRECT. */
+static int   g_direct      = 0;
 
 static double now_s(void){
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
@@ -304,8 +312,24 @@ typedef struct {
 
 /* One slot of the global routed-expert cache. Keyed by (layer, eid): every
  * routed expert in this model has identical dimensions, so a single pool can
- * hold experts from any layer without fragmentation. */
-typedef struct { int layer, eid; W w1,w3,w2; uint64_t used; } ESlot;
+ * hold experts from any layer without fragmentation. `base` is a 4K-aligned
+ * slab that holds the expert's six byte segments (w1/w3/w2 weights + their
+ * ue8m0 scales); the W views point into it, so a cache-miss is a pread that
+ * overwrites the slab -- no malloc/free on the hot path. */
+typedef struct {
+    int layer, eid;
+    W w1,w3,w2;
+    uint64_t used;
+    uint8_t *base; size_t base_cap;
+} ESlot;
+
+/* One routed expert's six on-disk byte spans, resolved ONCE at load so the
+ * hot path does zero st_find and no byte-count validation. Order is the file
+ * order: w1.weight, w1.scale, w3.weight, w3.scale, w2.weight, w2.scale.
+ * The checkpoint (and the tiny fixture) packs them back-to-back per expert,
+ * so `contig` collapses the whole expert to a SINGLE pread -- the batched
+ * expert I/O this engine was doing six preads per expert before. */
+typedef struct { int fd[6]; int64_t off[6]; int contig; } ExRef;
 
 typedef struct {
     DSV4Cfg c;
@@ -316,6 +340,9 @@ typedef struct {
     W hc_head_fn, hc_head_base, hc_head_scale;
     Layer *L;
     ESlot *eslot; int n_eslot; int64_t expert_bytes;
+    /* Per-expert on-disk geometry, built once at load (see ExRef). */
+    ExRef *xref;
+    int64_t e_w1p, e_w1s, e_w2p, e_w2s, e_slot;
     uint64_t clock;
     uint64_t expert_hits, expert_miss;
     double expert_load_s;
@@ -611,6 +638,48 @@ static void model_load(Model *m, const char *dir){
             fprintf(stderr,"  note: the cache is smaller than one token's working set — "
                     "every layer will miss. Raise --expert-gb to at least %.1f to hold it.\n",
                     (double)per_token*m->expert_bytes/1e9);
+
+        /* Per-expert on-disk geometry: resolve the six byte spans (weights +
+         * ue8m0 scales) and their contiguity ONCE, so the hot path does zero
+         * st_find and the byte-count refusal happens here, at load, instead
+         * of mid-inference. Same shape as kimi_k3.c's ERef table. */
+        m->e_w1p=MI*((D+1)/2); m->e_w1s=MI*((D+31)/32);   /* w1/w3: [MI,D] fp4 */
+        m->e_w2p=D*((MI+1)/2); m->e_w2s=D*((MI+31)/32);   /* w2:    [D,MI] fp4 */
+        m->e_slot=2*(m->e_w1p+m->e_w1s)+m->e_w2p+m->e_w2s;
+        m->xref=(ExRef*)xzalloc((size_t)c->n_layers*c->n_routed_experts*sizeof(ExRef),
+                                "expert on-disk table");
+        int64_t want[6]={m->e_w1p,m->e_w1s,m->e_w1p,m->e_w1s,m->e_w2p,m->e_w2s};
+        const char *mat[3]={"w1","w3","w2"};
+        int missing=0;
+        for(int l=0;l<c->n_layers;l++){
+            for(int e=0;e<c->n_routed_experts;e++){
+                ExRef *er=&m->xref[(int64_t)l*c->n_routed_experts+e];
+                er->fd[0]=-1;
+                for(int k=0;k<6;k++){
+                    char nm[192], sn0[192];
+                    snprintf(nm,sizeof nm,"layers.%d.ffn.experts.%d.%s.weight",l,e,mat[k/2]);
+                    const char *key=(k&1) ? (dsv4_scale_name(sn0,sizeof sn0,nm), sn0) : nm;
+                    st_tensor *t=st_find(&m->S,key);
+                    if(!t){ missing++; er->fd[k]=-1; continue; }
+                    if(t->nbytes!=want[k]){
+                        fprintf(stderr,"%s: %lld bytes, expected %lld — refusing (untrusted container)\n",
+                                key,(long long)t->nbytes,(long long)want[k]); exit(1); }
+                    er->fd[k]=t->fd; er->off[k]=t->off;
+                    if(l==0 && e==0 && getenv("DSV4_DEBUG"))
+                        fprintf(stderr,"[XREF] L0E0 k=%d key=%s off=%lld nbytes=%lld\n",k,key,
+                                (long long)t->off,(long long)t->nbytes);
+                }
+                /* HF shards pack an expert's six tensors back-to-back — collapse
+                 * the load to ONE pread when true. */
+                er->contig=1;
+                for(int k=0;k<5;k++)
+                    if(er->fd[k]!=er->fd[k+1]||er->off[k]+want[k]!=er->off[k+1]) er->contig=0;
+                if(getenv("DSV4_FALLBACK")) er->contig=0;
+            }
+        }
+        if(missing && g_verbose)
+            fprintf(stderr,"  note: %d routed-expert tensors missing (incomplete download?) — touching one aborts\n",
+                    missing);
     }
 
     /* scratch */
@@ -634,11 +703,113 @@ static void model_load(Model *m, const char *dir){
 }
 
 /* --------------------------------------------------------- expert streaming
- * Per-layer LRU over the routed experts. Nothing clever: the point of this
- * first implementation is correctness, and the interesting placement work
- * (routing heat, learned pins, one-layer-ahead prefetch -- and, on the three
- * hash layers, exact prefetch from the token id) belongs on top of a loader
- * that is known to read the right bytes. */
+ * Per-layer LRU over the routed experts (global slot pool, keyed by
+ * layer/eid; every routed expert has one shape so the pool is unfragmented).
+ * The interesting placement work (routing heat, learned pins, one-layer-ahead
+ * prefetch -- and, on the hash layers, exact prefetch from the token id)
+ * belongs on top of a loader that is known to read the right bytes.
+ *
+ * BATCHED EXPERT I/O: a cache-miss used to be SIX st_read_raw preads (w1,w3,w2
+ * + their three scales), each with its own st_find + byte validation and a
+ * malloc/free of its buffers. Now the six spans were resolved ONCE into xref
+ * at load; the slot owns one 4K-aligned slab; and a miss reads the whole
+ * expert with a SINGLE pread (contiguous path, the checkpoint's own layout)
+ * or, when the tensors straddle a shard boundary, six per-piece preads packed
+ * into that same slab. The W views point into the slab -- zero copies, zero
+ * hot-path allocation. With --direct the contiguous read goes through the
+ * twin O_DIRECT/F_NOCACHE fd; otherwise the WILLNEED prefetch warms the page
+ * cache ahead of the demand reads (overlap with compute). */
+
+/* Issue async readahead (WILLNEED) for a list of experts. Hints only — never
+ * changes what is read. Skipped under --direct (no page cache to warm). */
+static void expert_prefetch(Model *m, int layer, const int *eids, int n){
+    if(g_direct) return;
+    int64_t sizes[6]={m->e_w1p,m->e_w1s,m->e_w1p,m->e_w1s,m->e_w2p,m->e_w2s};
+    for(int j=0;j<n;j++){
+        if(eids[j]<0) continue;
+        ExRef *er=&m->xref[(int64_t)layer*m->c.n_routed_experts+eids[j]];
+        if(er->fd[0]<0) continue;
+        if(er->contig){ if(er->fd[0]>=0) posix_fadvise(er->fd[0],er->off[0],m->e_slot,POSIX_FADV_WILLNEED); }
+        else for(int k=0;k<6;k++) if(er->fd[k]>=0) posix_fadvise(er->fd[k],er->off[k],sizes[k],POSIX_FADV_WILLNEED);
+    }
+}
+
+/* Load expert (layer,eid) into slot v's slab and point the three W views at
+ * it. The W geometry is fixed for all routed experts, so the slab is
+ * allocated once per slot (lazily). Mirrors kimi_k3.c's expert_read. */
+static void expert_load_slot(Model *m, ESlot *v, int layer, int eid){
+    if(!v->base){
+        if(posix_memalign((void**)&v->base,4096,(size_t)m->e_slot+8192)){
+            fprintf(stderr,"OOM expert slot\n"); exit(1); }
+        v->base_cap=(size_t)m->e_slot+8192;
+    }
+    ExRef *er=&m->xref[(int64_t)layer*m->c.n_routed_experts+eid];
+    if(er->fd[0]<0){ fprintf(stderr,"[DSV4] expert L%d E%d missing on disk\n",layer,eid); exit(1); }
+    if(getenv("DSV4_DEBUG")) fprintf(stderr,"[DSV4] load L%d E%d contig=%d off[0..5]=%lld,%lld,%lld,%lld,%lld,%lld\n",
+        layer,eid,er->contig,(long long)er->off[0],(long long)er->off[1],(long long)er->off[2],
+        (long long)er->off[3],(long long)er->off[4],(long long)er->off[5]);
+
+    W *w1=&v->w1,*w3=&v->w3,*w2=&v->w2;
+    w1->role=w3->role=DSV4_T_FP4; w1->O=w3->O=m->c.moe_inter_dim; w1->I=w3->I=m->c.dim;
+    w2->role=DSV4_T_FP4; w2->O=m->c.dim; w2->I=m->c.moe_inter_dim;
+
+    uint8_t *base=v->base;
+    if(er->contig){
+        int dfd=g_direct?st_direct_fd(&m->S,er->fd[0]):-1;
+        if(dfd>=0){
+            /* Aligned window read; sub-4K head slack and the tail past the
+             * last aligned block are fetched with a tiny buffered pread —
+             * O_DIRECT/F_NOCACHE wants aligned lengths. */
+            int64_t a0=er->off[0]&~4095LL, pad=er->off[0]-a0;
+            int64_t want=pad+m->e_slot;
+            struct stat sb;
+            int64_t dlen=(want+4095)&~4095LL;
+            if(fstat(dfd,&sb)==0 && a0+dlen>sb.st_size) dlen=(sb.st_size-a0)&~4095LL;
+            if(dlen>0) st_pread_full(dfd,v->base,dlen,a0,"pread expert direct");
+            if(dlen<want) st_pread_full(er->fd[0],v->base+dlen,want-dlen,a0+dlen,"pread expert tail");
+            base=v->base+pad;
+        } else {
+            /* One pread for the whole expert (the batched-I/O fast path). */
+            st_pread_full(er->fd[0],v->base,m->e_slot,er->off[0],"pread expert");
+            if(getenv("DSV4_DEBUG")){
+                /* self-check: the single coalesced pread must be byte-identical
+                 * to the per-piece packing of the same six spans. */
+                static uint8_t *scr; static size_t scr_cap;
+                size_t need=(size_t)m->e_slot+8192;
+                if(!scr || scr_cap<need){ scr=realloc(scr,need); scr_cap=need; }
+                uint8_t *b=scr; size_t o=0;
+                int64_t ss[6]={m->e_w1p,m->e_w1s,m->e_w1p,m->e_w1s,m->e_w2p,m->e_w2s};
+                for(int k=0;k<6;k++){ st_pread_full(er->fd[k],b+o,ss[k],er->off[k],"chk"); o+=(size_t)ss[k]; }
+                if(memcmp(v->base,b,m->e_slot)){
+                    fprintf(stderr,"[DSV4] FAST-PATH MISMATCH L%d E%d\n",layer,eid);
+                } else {
+                    fprintf(stderr,"[DSV4] fast-path ok L%d E%d\n",layer,eid);
+                }
+            }
+        }
+    } else {
+        /* Rare: an expert's own tensors straddle a shard boundary. Pack them
+         * back-to-back in the slab with per-piece preads. */
+        int64_t sizes[6]={m->e_w1p,m->e_w1s,m->e_w1p,m->e_w1s,m->e_w2p,m->e_w2s};
+        uint8_t *dst=v->base;
+        for(int k=0;k<6;k++){
+            if(er->fd[k]<0){ fprintf(stderr,"[DSV4] expert L%d E%d tensor %d missing on disk\n",layer,eid,k); exit(1); }
+            st_pread_full(er->fd[k],dst,sizes[k],er->off[k],"pread expert");
+            dst+=sizes[k];
+        }
+    }
+    /* W views into the slab, in file order: w1p w1s w3p w3s w2p w2s. */
+    w1->b=base;                          w1->e8=base+m->e_w1p;
+    w3->b=base+m->e_w1p+m->e_w1s;        w3->e8=base+m->e_w1p+m->e_w1s+m->e_w1p;
+    w2->b=base+m->e_w1p+m->e_w1s+m->e_w1p+m->e_w1s;      w2->e8=base+m->e_w1p+m->e_w1s+m->e_w1p+m->e_w1s+m->e_w2p;
+
+    v->layer=layer; v->eid=eid; v->used=++m->clock; m->expert_miss++;
+    if(layer==0 && eid==0 && getenv("DSV4_DEBUG"))
+        fprintf(stderr,"[E0] contig=%d w1.b[0..3]=%u,%u,%u,%u w1.e8[0]=%u w2.b[0..3]=%u,%u,%u,%u w2.e8[0]=%u\n",
+                er->contig,w1->b[0],w1->b[1],w1->b[2],w1->b[3],w1->e8[0],
+                w2->b[0],w2->b[1],w2->b[2],w2->b[3],w2->e8[0]);
+}
+
 static void expert_get(Model *m, int layer, int eid, W **w1, W **w3, W **w2){
     for(int s=0;s<m->n_eslot;s++) if(m->eslot[s].layer==layer && m->eslot[s].eid==eid){
         m->eslot[s].used=++m->clock; m->expert_hits++;
@@ -650,19 +821,9 @@ static void expert_get(Model *m, int layer, int eid, W **w1, W **w3, W **w2){
         if(m->eslot[s].used<m->eslot[victim].used) victim=s;
     }
     ESlot *v=&m->eslot[victim];
-    if(v->eid>=0){ w_free(&v->w1); w_free(&v->w3); w_free(&v->w2); }
     double t0=now_s();
-    DSV4Tensor t;
-    memset(&t,0,sizeof t); t.role=DSV4_T_FP4; t.d0=m->c.moe_inter_dim; t.d1=m->c.dim;
-    snprintf(t.name,sizeof t.name,"layers.%d.ffn.experts.%d.w1.weight",layer,eid);
-    w_load(&m->S,&t,&v->w1,1);
-    snprintf(t.name,sizeof t.name,"layers.%d.ffn.experts.%d.w3.weight",layer,eid);
-    w_load(&m->S,&t,&v->w3,1);
-    memset(&t,0,sizeof t); t.role=DSV4_T_FP4; t.d0=m->c.dim; t.d1=m->c.moe_inter_dim;
-    snprintf(t.name,sizeof t.name,"layers.%d.ffn.experts.%d.w2.weight",layer,eid);
-    w_load(&m->S,&t,&v->w2,1);
+    expert_load_slot(m,v,layer,eid);
     m->expert_load_s += now_s()-t0;
-    v->layer=layer; v->eid=eid; v->used=++m->clock; m->expert_miss++;
     *w1=&v->w1; *w3=&v->w3; *w2=&v->w2;
 }
 
@@ -880,6 +1041,10 @@ static void moe(Model *m, Layer *L, const float *xin, int token_id, float *out){
         n=dsv4_route(logits,L->gate_bias.f,E,K,c->norm_topk,c->route_scale,idx,wt);
     }
     free(logits);
+    /* Prefetch this token's experts before applying any: the router already
+     * picked them, so the WILLNEED lands while the first matmuls run (overlap
+     * with compute on the buffered path). */
+    expert_prefetch(m,(int)(L-m->L),idx,n);
 
     memset(out,0,(size_t)D*sizeof(float));
     for(int i=0;i<n;i++){
@@ -1063,6 +1228,18 @@ static void prefill_chunk(Model *m, const int *ids, int pos0, int C,
             int j=map[IDX[(size_t)t*K+k]];
             poslist[cur[j]]=t; slotlist[cur[j]]=k; cur[j]++;
         }
+        /* Loads in DISK-OFFSET order (the checkpoint is not expert-id-ordered
+         * inside a layer), and WILLNEED the whole working set before the first
+         * demand read so kernel readahead overlaps the matmuls that follow. */
+        for(int a2=0;a2<nu-1;a2++) for(int b2=a2+1;b2<nu;b2++){
+            ExRef *ea=&m->xref[(int64_t)l*E+uid[a2]], *eb=&m->xref[(int64_t)l*E+uid[b2]];
+            if(eb->fd[0]<ea->fd[0]||(eb->fd[0]==ea->fd[0]&&eb->off[0]<ea->off[0])){
+                int tt=uid[a2];uid[a2]=uid[b2];uid[b2]=tt;
+                tt=pcnt[a2];pcnt[a2]=pcnt[b2];pcnt[b2]=tt;
+                tt=pfirst[a2];pfirst[a2]=pfirst[b2];pfirst[b2]=tt;
+            }
+        }
+        expert_prefetch(m,l,uid,nu);
         for(int j=0;j<nu;j++){
             W *w1,*w3,*w2;
             expert_get(m,l,uid[j],&w1,&w3,&w2);   /* ONE read for pcnt[j] tokens */
@@ -1281,6 +1458,8 @@ static void usage(const char *p){
       "       %s <model_dir> \"3,7,1\" --ids [--dump-logits out.json]   (oracle mode, no tokenizer)\n"
       "       %s <model_dir> --preflight     (check names and shapes, read no weights)\n"
       "  --chunk N: prefill tokens per pass of expert reads (default 32, 1 = per-token)\n"
+      "  --direct: expert reads via O_DIRECT / F_NOCACHE, bypassing the page cache\\n"
+      "           (drive-dependent, measure it; --direct disables the WILLNEED prefetch)\\n"
       "  DeepSeek-V4-Flash (284B MoE, 13B active). UNVERIFIED -- see the header comment.\n",p,p,p);
 }
 
@@ -1294,6 +1473,7 @@ int main(int argc, char **argv){
         else if(!strcmp(argv[i],"--expert-gb")&&i+1<argc) g_expert_gb=(float)atof(argv[++i]);
         else if(!strcmp(argv[i],"--max-seq")&&i+1<argc) g_max_seq=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--chunk")  &&i+1<argc) g_chunk=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--direct")) g_direct=1;
         else if(!strcmp(argv[i],"--quiet")) g_verbose=0;
         else if(!strcmp(argv[i],"--ids")) g_ids_mode=1;
         else if(!strcmp(argv[i],"--preflight")) g_preflight=1;

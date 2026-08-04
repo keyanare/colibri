@@ -191,11 +191,12 @@ def tiny_config():
 
 def coff(ratio):  return 2 if ratio == 4 else 1
 
-def build(outdir, seed=1234):
+def build(outdir, seed=1234, gap=False, write=True):
     cfg = tiny_config()
     os.makedirs(outdir, exist_ok=True)
-    with open(os.path.join(outdir, "config.json"), "w") as f:
-        json.dump(cfg, f, indent=1)
+    if write:
+        with open(os.path.join(outdir, "config.json"), "w") as f:
+            json.dump(cfg, f, indent=1)
 
     g = Gen(seed)
     D, HC = cfg["hidden_size"], cfg["hc_mult"]
@@ -261,12 +262,22 @@ def build(outdir, seed=1234):
         for e in range(E):
             g.fp4(f"layers.{l}.ffn.experts.{e}.w1.weight", MI, D)
             g.fp4(f"layers.{l}.ffn.experts.{e}.w3.weight", MI, D)
+            # gap=True: park a small PLAIN tensor in the middle of expert 0's
+            # six tensors so its spans are NOT contiguous on disk. The engine
+            # never reads it (name not in the manifest / xref), but its bytes
+            # shift expert 0's w2 off-by-a-gap, which is exactly the case that
+            # must fall back to per-piece loads and still be bit-identical.
+            # The other E-1 experts stay contiguous, so one model exercises
+            # BOTH the coalesced single-pread path AND the fallback.
+            if gap and e == 0:
+                g.plain(f"layers.{l}.ffn.experts.0.__gap", (16,), scale=0.0)
             g.fp4(f"layers.{l}.ffn.experts.{e}.w2.weight", D, MI)
         g.fp8(f"layers.{l}.ffn.shared_experts.w1.weight", MI, D)
         g.fp8(f"layers.{l}.ffn.shared_experts.w3.weight", MI, D)
         g.fp8(f"layers.{l}.ffn.shared_experts.w2.weight", D, MI)
 
-    g.write(os.path.join(outdir, "model.safetensors"))
+    if write:
+        g.write(os.path.join(outdir, "model.safetensors"))
     return cfg, g
 
 # ---------------------------------------------------------------- reference
@@ -566,6 +577,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("outdir")
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--gap", action="store_true",
+                    help="insert a filler tensor inside expert 0 (breaks its contiguity; "
+                         "exercises the per-piece loader fallback)")
     ap.add_argument("--ngen", type=int, default=4)
     ap.add_argument("--ids", default=",".join(map(str, DEFAULT_IDS)))
     ap.add_argument("--check", metavar="GOT_JSON",
@@ -575,7 +589,22 @@ def main():
     a = ap.parse_args()
     ids = [int(t) for t in a.ids.split(",") if t.strip()]
 
-    cfg, g = build(a.outdir, a.seed)
+    # --check recomputes the reference from a freshly built generator, so it
+    # must use the SAME fixture geometry the engine read. Read the existing
+    # model.safetensors and derive `gap` from what is actually on disk instead
+    # of trusting the caller to pass --gap again -- a gap shifts every byte of
+    # expert 0's w2 (RNG is sequential), so a mismatched flag is a silent
+    # wrong-reference, not just an extra file.
+    if a.check:
+        try:
+            with open(os.path.join(a.outdir, "model.safetensors"), "rb") as f:
+                n = struct.unpack("<Q", f.read(8))[0]
+                hdr = json.loads(f.read(n))
+            a.gap = any("__gap" in k for k in hdr)
+        except OSError:
+            a.gap = False
+
+    cfg, g = build(a.outdir, a.seed, a.gap, write=not a.check)
     ref = RefModel(cfg, g)
 
     steps, pos, tok = [], 0, ids[0]
