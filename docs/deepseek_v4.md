@@ -329,8 +329,20 @@ Three real defects were caught this way, which is the argument for the harness:
    tensors (norms, `hc_*`, `ape`, `attn_sink`, `gate_bias`) still consume
    `w->f` directly in the primitives, so they stay f32 — only matmul-consumed
    dense tensors halve.
-5. **Exact prefetch on the hash layers** — the one place in this repository where
-   the working set is knowable in advance.
+5. ✅ **Exact prefetch on the hash layers** — done (2026-08-07). On layers
+   `l < n_hash_layers` the router is a lookup, not a prediction: `tid2eid` maps
+   the input token id straight to the K experts that token will use, and
+   `dsv4_route_hash` picks exactly that set (weights from the gate logits, the
+   SET from the table). So the working set is knowable with **zero forward
+   compute** — the one place in this repository where expert placement needs no
+   routing heat, no learned pin, no one-layer-ahead lookahead. `hash_prefetch`
+   collects the union over a chunk (prefill, issued before the layer's attention
+   sublayer) or a single token (decode, issued at `forward` entry for all hash
+   layers at once) and WILLNEEDs it, so those reads overlap the dense work that
+   precedes the FFN instead of starting cold after it. Exact by construction and
+   a hint only — never changes what is read, so the logits are byte-identical
+   (the fixture's hash-routed layer 0 exercises both paths; `[HASH]` lines under
+   `DSV4_DEBUG` show the union size). `--direct` skips it like every prefetch.
 6. **A token-exact oracle** on the real checkpoint. Everything above is
    provisional until this exists.
 

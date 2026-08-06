@@ -396,6 +396,10 @@ typedef struct {
     int32_t *idxbuf; int idxcap;
     float *iscore;   /* indexer scores over compressed positions */
     int   *itop;
+    /* Exact hash-layer prefetch scratch (see hash_prefetch): the union of
+     * experts a batch of token ids will route to on one hash layer, collected
+     * without any forward compute. */
+    int *hpf_eid; unsigned char *hpf_seen;
 } Model;
 
 /* ------------------------------------------------------------------ math */
@@ -740,6 +744,8 @@ static void model_load(Model *m, const char *dir){
     m->idxbuf  =(int32_t*)xalloc((size_t)m->idxcap*sizeof(int32_t),"index buffer");
     m->iscore  =(float*)xalloc((size_t)(g_max_seq/4+8)*sizeof(float),"indexer scores");
     m->itop    =(int*)xalloc((size_t)(g_max_seq/4+8)*sizeof(int),"indexer topk");
+    m->hpf_eid =(int*)xalloc((size_t)c->n_routed_experts*sizeof(int),"hash prefetch eid");
+    m->hpf_seen=(unsigned char*)xzalloc((size_t)c->n_routed_experts,"hash prefetch seen");
 }
 
 /* --------------------------------------------------------- expert streaming
@@ -772,6 +778,42 @@ static void expert_prefetch(Model *m, int layer, const int *eids, int n){
         if(er->contig){ if(er->fd[0]>=0) posix_fadvise(er->fd[0],er->off[0],m->e_slot,POSIX_FADV_WILLNEED); }
         else for(int k=0;k<6;k++) if(er->fd[k]>=0) posix_fadvise(er->fd[k],er->off[k],sizes[k],POSIX_FADV_WILLNEED);
     }
+}
+
+/* EXACT HASH-LAYER PREFETCH. On layers l < n_hash_layers the router is a
+ * lookup, not a prediction: tid2eid maps the input token id straight to the
+ * K experts that token will use, and dsv4_route_hash picks exactly that set
+ * (weights come from the gate logits, the SET comes from the table -- see
+ * dsv4_route_hash). So the working set is knowable with ZERO forward compute:
+ * the one place in this repository where expert placement needs no routing
+ * heat, no learned pin, no one-layer-ahead lookahead.
+ *
+ * Collect the union over the given token ids and WILLNEED it NOW, so those
+ * reads overlap the attention sublayer and the dense routing matmul that run
+ * before the FFN instead of starting cold after them. Exact by construction:
+ * every prefetched expert sits on a row some token will route through, and no
+ * row entry is missed. A hint only -- it never changes what is read, so the
+ * logits are untouched, and --direct skips it like every other prefetch. */
+static void hash_prefetch(Model *m, Layer *L, const int *ids, int C){
+    if(!L->hash) return;
+    const DSV4Cfg *c=&m->c;
+    int K=c->n_activated_experts;
+    int nu=0;
+    for(int t=0;t<C;t++){
+        const int32_t *row=L->tid2eid.i32+(size_t)ids[t]*K;
+        for(int k=0;k<K;k++){
+            int e=row[k];
+            /* entries were validated into [0,E) at load (see model_load), and
+             * K<=64 <= E here; the seen map dedups repeated row entries. */
+            if(m->hpf_seen[e]) continue;
+            m->hpf_seen[e]=1; m->hpf_eid[nu++]=e;
+        }
+    }
+    for(int j=0;j<nu;j++) m->hpf_seen[m->hpf_eid[j]]=0;
+    if(getenv("DSV4_DEBUG"))
+        fprintf(stderr,"[HASH] exact prefetch L%d: %d unique experts for %d token ids\n",
+                (int)(L-m->L),nu,C);
+    expert_prefetch(m,(int)(L-m->L),m->hpf_eid,nu);
 }
 
 /* Load expert (layer,eid) into slot v's slab and point the three W views at
@@ -1140,6 +1182,12 @@ static void forward(Model *m, int token_id, int pos){
      * `h.unsqueeze(2).repeat(1,1,hc_mult,1)`): hc_pre's gates are what
      * differentiates them from the first layer onward. */
     for(int j=0;j<HC;j++) memcpy(m->x+(size_t)j*D,m->embrow,(size_t)D*sizeof(float));
+    /* The hash layers route by table, so this token's whole expert working
+     * set is known before the first layer runs. WILLNEED it all now: the
+     * reads overlap the dense work of the entire stack instead of starting
+     * per-layer after each routing. */
+    if(c->n_hash_layers)
+        for(int l=0;l<c->n_hash_layers;l++) hash_prefetch(m,&m->L[l],&token_id,1);
     for(int l=0;l<c->n_layers;l++) block(m,l,pos,token_id);
     /* Collapse the four streams through the head's OWN hc gates -- not a plain
      * sum. The Transformer carries hc_head_fn/base/scale for exactly this. */
@@ -1219,6 +1267,12 @@ static void prefill_chunk(Model *m, const int *ids, int pos0, int C,
             fprintf(stderr,"\r  prefill %d/%d tokens · layer %d/%d · %.0fs elapsed, ~%.0fs left    ",
                     pos0,total,l+1,c->n_layers,el, frac>0 ? el/frac-el : 0.0);
         }
+
+        /* Hash layers: the chunk's expert set is a pure function of the token
+         * ids, so WILLNEED it BEFORE the attention sublayer -- those reads then
+         * overlap this layer's attention and routing compute. Phase 2's prefetch
+         * (after routing) becomes a redundant hint on the same region. */
+        if(L->hash) hash_prefetch(m,L,ids,C);
 
         /* attention sublayer -- token order, because every piece of state here
          * (the kv ring, the compressor window, the indexer) is a recurrence. */
