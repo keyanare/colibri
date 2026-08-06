@@ -71,7 +71,15 @@ enum {
                          * quantization_config) -- the format colibri.c's fmt=8 reads */
     DSV4_T_FP4,         /* mxfp4 routed expert: `<name>` is [O,I/2] nibbles,
                          * `<name>.scale` is [O,I/32] ue8m0 -- quant.h's matmul_mxfp4 */
-    DSV4_T_I32          /* tid2eid hash table, int32, no sidecar */
+    DSV4_T_I32,         /* tid2eid hash table, int32, no sidecar */
+    DSV4_T_PLAIN_BF16   /* unquantized bf16 (2 bytes/element), no sidecar, consumed
+                         * ONLY through w_matmul: the loader keeps it bf16 in RAM and
+                         * the matmul decodes on the fly (bf16->f32 is exact), so the
+                         * resident set costs half what the plain-f32 role does.
+                         * head.weight and the compressor wkv/wgate projections, whose
+                         * on-disk bf16 dtype was confirmed against the real -0731
+                         * checkpoint. Refuses a tensor that is not actually BF16 --
+                         * silently doubling memory on an f32 surprise is a misread. */
 };
 
 typedef struct {
@@ -254,8 +262,8 @@ static void dsv4_compressor_tensors(DSV4List *L, const DSV4Cfg *c, const char *p
      * Small enough to be plausible either way, which is why the sidecar's
      * absence, not the byte count, is what settles it. */
     dsv4_push(L,DSV4_T_PLAIN,0,ratio,(int64_t)coff*hd, "%s.ape",   prefix);
-    dsv4_push(L,DSV4_T_PLAIN,0,(int64_t)coff*hd,c->dim, "%s.wkv.weight",   prefix);
-    dsv4_push(L,DSV4_T_PLAIN,0,(int64_t)coff*hd,c->dim, "%s.wgate.weight", prefix);
+    dsv4_push(L,DSV4_T_PLAIN_BF16,0,(int64_t)coff*hd,c->dim, "%s.wkv.weight",   prefix);
+    dsv4_push(L,DSV4_T_PLAIN_BF16,0,(int64_t)coff*hd,c->dim, "%s.wgate.weight", prefix);
     dsv4_push(L,DSV4_T_PLAIN,0,hd,0,                    "%s.norm.weight",  prefix);
 }
 
@@ -334,11 +342,13 @@ static void dsv4_layer_tensors(DSV4List *L, const DSV4Cfg *c, int l){
 static void dsv4_global_tensors(DSV4List *L, const DSV4Cfg *c){
     dsv4_push(L,DSV4_T_PLAIN,0,c->vocab_size,c->dim, "embed.weight");
     dsv4_push(L,DSV4_T_PLAIN,0,c->dim,0,             "norm.weight");
-    /* PLAIN, not FP8. The output projection is the largest single dense tensor
-     * in the model and the obvious candidate for quantization, but the
-     * checkpoint ships it bf16 -- 2 bytes/element, and no `head.scale` exists
-     * beside it. Same class as embed.weight, which it mirrors. */
-    dsv4_push(L,DSV4_T_PLAIN,0,c->vocab_size,c->dim, "head.weight");
+    /* PLAIN_BF16, not PLAIN and not FP8. The output projection is the largest
+     * single dense tensor in the model and the obvious candidate for
+     * quantization, but the checkpoint ships it bf16 -- 2 bytes/element, and no
+     * `head.scale` exists beside it. Kept bf16 in RAM: it is consumed ONLY
+     * through w_matmul, which decodes on the fly (bf16->f32 is exact). Same
+     * class as embed.weight, which it mirrors. */
+    dsv4_push(L,DSV4_T_PLAIN_BF16,0,c->vocab_size,c->dim, "head.weight");
     /* The head's OWN hyper-connection gates, which collapse the hc_mult
      * residual streams to one before the output norm. Note the row count is
      * hc_mult, not (2+hc)*hc: only the `pre` family exists here, because
@@ -401,14 +411,14 @@ static int64_t dsv4_tensor_numel(const DSV4Tensor *t){
 /* On-disk bytes for a tensor INCLUDING its scale sidecar, per role:
  *   FP8: O*I raw e4m3 + ceil(O/128)*ceil(I/128) ue8m0 scale bytes
  *   FP4: O*ceil(I/2) nibbles + O*ceil(I/32) ue8m0 scale bytes  (mxfp4)
- *   I32: 4 bytes/element;  PLAIN: bf16, 2 bytes/element */
+ *   I32: 4 bytes/element;  PLAIN/PLAIN_BF16: bf16, 2 bytes/element */
 static int64_t dsv4_tensor_bytes(const DSV4Tensor *t){
     int64_t O=t->d0, I=t->d1?t->d1:1, n=O*I;
     switch(t->role){
         case DSV4_T_FP8: return n + dsv4_nblk128(O)*dsv4_nblk128(I);
         case DSV4_T_FP4: return O*((I+1)/2) + O*((I+31)/32);
         case DSV4_T_I32: return n*4;
-        default:         return n*2;
+        default:         return n*2;   /* PLAIN and PLAIN_BF16 both ship bf16 */
     }
 }
 

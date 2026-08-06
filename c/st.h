@@ -708,6 +708,9 @@ static int64_t st_numel(shards *S, const char *name) {
 static int64_t st_nbytes(shards *S, const char *name) {
     st_tensor *t = st_find(S, name); return t ? t->nbytes : -1;
 }
+static int st_dtype(shards *S, const char *name) {
+    st_tensor *t = st_find(S, name); return t ? t->dtype : -1;
+}
 
 /* legge i byte GREZZI di un tensore (nessuna conversione di dtype): per i pesi gia'
  * quantizzati int4/int8 del nostro container (dtype U8). drop=1 -> fadvise DONTNEED. */

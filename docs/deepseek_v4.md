@@ -224,7 +224,7 @@ whole working set: **6 experts × 43 layers × 13.4 MB ≈ 3.4 GB read per token
 
 | | Apple M5, 16 GB, ~5 GB/s SSD | i7-11700, 32 GB, 3 GB/s NVMe |
 |---|---|---|
-| resident | ~9.7 GB | ~9.7 GB |
+| resident | ~8.0 GB | ~8.0 GB |
 | expert cache | 3–4 GB (~5 experts/layer) | ~20 GB (~35 experts/layer) |
 | expert kernels | NEON (I%32==0) | AVX2 |
 | estimate | ~1.5–3 s/token | **measured: 3.8 s/token prefill, 4.0 s/token decode** (`--expert-gb 3.5`, 197-token prompt) |
@@ -315,11 +315,20 @@ Three real defects were caught this way, which is the argument for the harness:
    prefill, sorted by disk offset). `tools/make_tiny_dsv4.py --gap` breaks one
    expert's contiguity so the fallback is exercised; pinned by new CI tests
    (`test_dsv4_fixture.py`, both `--gap` and `--direct`).
-4. **Keep the unquantized tensors bf16 in RAM.** `head.weight` alone is 1.06 GB
+4. ✅ **Keep the unquantized tensors bf16 in RAM.** `head.weight` alone is 1.06 GB
    on disk and 2.1 GB resident, because the PLAIN role expands everything to
    f32 at load. Together with the compressor projections that is ~3.5 GB held
    at twice the necessary width — the difference between fitting and swapping
-   on a 16 GB machine.
+   on a 16 GB machine. Done (2026-08-06): a new `DSV4_T_PLAIN_BF16` role keeps
+   `head.weight` and the compressor `wkv`/`wgate` projections bf16 (2
+   bytes/element) in RAM; `w_matmul` decodes bf16→f32 on the fly, which is
+   bit-exact, so the numpy oracle in `test_dsv4_fixture.py` is unchanged and
+   still passes (rel-L2 1e-5). The role refuses a tensor that is not actually
+   bf16 — F16 is also 2 bytes/element but a bf16 decode of F16 bits is a
+   silent misread, so the dtype is checked and named. Remaining small PLAIN
+   tensors (norms, `hc_*`, `ape`, `attn_sink`, `gate_bias`) still consume
+   `w->f` directly in the primitives, so they stay f32 — only matmul-consumed
+   dense tensors halve.
 5. **Exact prefetch on the hash layers** — the one place in this repository where
    the working set is knowable in advance.
 6. **A token-exact oracle** on the real checkpoint. Everything above is

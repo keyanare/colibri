@@ -384,13 +384,16 @@ static void test_roles(void){
         /* The compressor projections are unquantized -- and ONLY those. The
          * same leaf names under .attn (wkv) are fp8, so match the prefix, not
          * the leaf: pinning this is what keeps a future edit from "restoring"
-         * the symmetry the rest of the model has. */
+         * the symmetry the rest of the model has. They ship bf16 and are kept
+         * bf16 in RAM (decoded on the fly in w_matmul), so PLAIN_BF16. */
         if(strstr(t->name,".compressor.wkv.weight")
            ||strstr(t->name,".compressor.wgate.weight"))
-            CHECK(t->role==DSV4_T_PLAIN);
+            CHECK(t->role==DSV4_T_PLAIN_BF16);
         if(strstr(t->name,".attn.wkv.weight")) CHECK(t->role==DSV4_T_FP8);
-        /* The two biggest dense tensors are unquantized in the checkpoint. */
-        if(!strcmp(t->name,"head.weight"))  CHECK(t->role==DSV4_T_PLAIN);
+        /* The two biggest dense tensors are unquantized in the checkpoint;
+         * head.weight ships bf16 and is the largest single dense tensor, so it
+         * stays bf16 in RAM (PLAIN_BF16) instead of expanding to f32. */
+        if(!strcmp(t->name,"head.weight"))  CHECK(t->role==DSV4_T_PLAIN_BF16);
         if(!strcmp(t->name,"embed.weight")) CHECK(t->role==DSV4_T_PLAIN);
         CHECK(t->d0>0);
         CHECK(t->d1>=0);

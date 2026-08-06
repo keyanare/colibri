@@ -143,6 +143,7 @@ typedef struct {
     float   *s;      /* FP8: f32 block scales (expanded)          */
     uint8_t *e8;     /* FP4: O*ceil(I/32) ue8m0 exponents         */
     float   *f;      /* PLAIN: O*I floats                          */
+    uint16_t *h;     /* PLAIN_BF16: O*I bf16, decoded in w_matmul  */
     int32_t *i32;    /* I32: O*I table entries                     */
 } W;
 
@@ -151,6 +152,7 @@ static int64_t w_bytes(const W *w){
         case DSV4_T_FP8: return w->O*w->I + dsv4_nblk128(w->O)*dsv4_nblk128(w->I)*4;
         case DSV4_T_FP4: return w->O*((w->I+1)/2) + w->O*((w->I+31)/32);
         case DSV4_T_I32: return w->O*w->I*4;
+        case DSV4_T_PLAIN_BF16: return w->O*w->I*2;
         default:         return w->O*w->I*4;
     }
 }
@@ -162,6 +164,26 @@ static void w_matmul(const W *w, float *y, const float *x, int S){
             matmul_fp8(y,x,w->b,w->s,S,(int)w->I,(int)w->O); break;
         case DSV4_T_FP4:
             matmul_mxfp4(y,x,w->b,w->e8,S,(int)w->I,(int)w->O); break;
+        case DSV4_T_PLAIN_BF16: {
+            /* Kept bf16 in RAM, decoded on the fly. bf16->f32 is EXACT, so each
+             * row decodes to the same f32 the PLAIN path would have materialized
+             * at load -- the logits are bit-identical, and the resident set is
+             * half the size. Deliberately scalar, like the PLAIN branch: the
+             * dense matmuls here (head, compressor wkv/wgate) already accumulate
+             * in double and are not the expert hot loop. */
+            int O=(int)w->O, I=(int)w->I;
+            const uint16_t *h=w->h;
+            #pragma omp parallel for schedule(static)
+            for(int o=0;o<O;o++){
+                const uint16_t *r=h+(int64_t)o*I;
+                for(int s=0;s<S;s++){
+                    const float *xs=x+(int64_t)s*I; double a=0;
+                    for(int i=0;i<I;i++) a+=(double)bf16_to_f32(r[i])*xs[i];
+                    y[(int64_t)s*O+o]=(float)a;
+                }
+            }
+            break;
+        }
         default: {
             int O=(int)w->O, I=(int)w->I;
             #pragma omp parallel for schedule(static)
@@ -178,7 +200,7 @@ static void w_matmul(const W *w, float *y, const float *x, int S){
 }
 
 static void w_free(W *w){
-    free(w->b); free(w->s); free(w->e8); free(w->f); free(w->i32);
+    free(w->b); free(w->s); free(w->e8); free(w->f); free(w->h); free(w->i32);
     memset(w,0,sizeof *w);
 }
 
@@ -256,6 +278,20 @@ static int w_load(shards *S, const DSV4Tensor *t, W *w, int required){
             fprintf(stderr,"%s: %lld bytes for %lld entries — expected %lld (int32) or %lld (int64)\n",
                     t->name,(long long)nb,(long long)n,(long long)(n*4),(long long)(n*8)); exit(1);
         }
+    } else if(t->role==DSV4_T_PLAIN_BF16){
+        /* Unquantized bf16, kept bf16 in RAM (2 bytes/element); w_matmul decodes
+         * on the fly. Must be actually-BF16: F16 is also 2 bytes/element but a
+         * bf16->f32 decode of F16 bits is a silent misread, so the dtype is
+         * refused, not guessed. */
+        int64_t n=w->O*w->I, nb=st_nbytes(S,t->name), dt=st_dtype(S,t->name);
+        if(nb!=n*2){ fprintf(stderr,"%s: %lld bytes, expected %lld for [%lld,%lld] bf16\n",
+            t->name,(long long)nb,(long long)(n*2),(long long)w->O,(long long)w->I); exit(1); }
+        if(dt!=0){  /* 0 = BF16; 1 = F16, 2 = F32 */
+            fprintf(stderr,"%s: dtype code %lld, expected 0 (BF16)\n",
+                    t->name,(long long)dt); exit(1);
+        }
+        w->h=(uint16_t*)xalloc((size_t)n*2,"bf16 weights");
+        st_read_raw(S,t->name,w->h,0);
     } else {
         int64_t n=w->O*w->I;
         w->f=(float*)xalloc((size_t)n*sizeof(float),"plain weights");
@@ -382,10 +418,14 @@ static void compressor_init(Model *m, Compressor *C, shards *S, const char *pref
         snprintf(t.name,sizeof t.name,"%s." suffix,prefix); \
         w_load(S,&t,&C->field,1); }while(0)
     LOADC(ape,   DSV4_T_PLAIN, ratio, (int64_t)C->coff*hd, "ape");
-    /* PLAIN, not FP8: the compressor projections ship unquantized, with no
-     * .scale sidecar -- see dsv4_compressor_tensors. */
-    LOADC(wkv,   DSV4_T_PLAIN, (int64_t)C->coff*hd, m->c.dim, "wkv.weight");
-    LOADC(wgate, DSV4_T_PLAIN, (int64_t)C->coff*hd, m->c.dim, "wgate.weight");
+    /* PLAIN_BF16, not FP8 and not PLAIN: the compressor projections ship
+     * unquantized bf16 with no .scale sidecar -- see dsv4_compressor_tensors.
+     * They are consumed ONLY through w_matmul, so keeping them bf16 in RAM
+     * halves the resident set (decoded on the fly, bit-exact). The manifest
+     * and preflight already require exact bf16; loading as PLAIN would expand
+     * to f32 and silently contradict them. */
+    LOADC(wkv,   DSV4_T_PLAIN_BF16, (int64_t)C->coff*hd, m->c.dim, "wkv.weight");
+    LOADC(wgate, DSV4_T_PLAIN_BF16, (int64_t)C->coff*hd, m->c.dim, "wgate.weight");
     LOADC(norm,  DSV4_T_PLAIN, hd, 1, "norm.weight");
     #undef LOADC
     size_t st_n=(size_t)C->coff*ratio*(size_t)C->coff*hd;
@@ -1324,6 +1364,7 @@ static int64_t pf_expect_weight(const DSV4Tensor *t){
         case DSV4_T_FP8: return O*I;                 /* raw e4m3 */
         case DSV4_T_FP4: return O*((I+1)/2);         /* packed nibbles */
         case DSV4_T_I32: return O*I*4;
+        case DSV4_T_PLAIN_BF16: return O*I*2;        /* bf16, must be exact */
         default:         return -1;                  /* PLAIN: bf16 or f32 */
     }
 }
