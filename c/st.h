@@ -640,13 +640,32 @@ static void st_die_missing(shards *S, const char *name) {
     exit(1);
 }
 
+/* Readahead hint, portably. POSIX_FADV_WILLNEED is a Linux/glibc call: on Darwin
+ * it is a stub that returns ENOSYS, so the whole prefetch machinery silently did
+ * nothing on macOS and expert loads serialized against compute (CPU idle at
+ * 20-30% while the disk crawled at ~600 MB/s). Darwin's spelling is
+ * fcntl(fd, F_RDADVISE, &radvisory): the kernel then read-aheads the range the
+ * same way WILLNEED does. FreeBSD has the same call; everything else keeps
+ * posix_fadvise. Advisory only -- never changes what is read. */
+static inline void st_willneed(int fd, int64_t off, int64_t len) {
+    if (fd < 0 || len <= 0) return;
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    struct radvisory ra;
+    ra.ra_offset = (off_t)off;
+    ra.ra_count  = (len > (int64_t)INT32_MAX) ? INT32_MAX : (int)len;
+    fcntl(fd, F_RDADVISE, &ra);
+#else
+    posix_fadvise(fd, off, len, POSIX_FADV_WILLNEED);
+#endif
+}
+
 /* prefetch ASINCRONO: dice al kernel di iniziare a leggere le pagine del tensore in
  * background (readahead). Serve a sovrapporre l'I/O degli expert col calcolo: si
  * prefetcha tutto il set di expert di un layer, poi le pread sincrone trovano la cache
  * gia' calda. No-op se il tensore non esiste (es. il primo .qs prima della lettura). */
 static void st_prefetch(shards *S, const char *name) {
     st_tensor *t = st_find(S, name);
-    if (t) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_WILLNEED);
+    if (t) st_willneed(t->fd, t->off, t->nbytes);
 }
 
 /* like st_prefetch, but on replica `rep`'s drive: the WILLNEED must warm the
@@ -656,7 +675,7 @@ static void st_prefetch_rep(shards *S, const char *name, int rep) {
     if (!t) return;
     int fd = st_fd_rep(S, t->fd, rep);
     if (fd < 0) fd = t->fd;
-    posix_fadvise(fd, t->off, t->nbytes, POSIX_FADV_WILLNEED);
+    st_willneed(fd, t->off, t->nbytes);
 }
 
 /* legge un tensore in un buffer float32 fornito dal chiamante (numel float).

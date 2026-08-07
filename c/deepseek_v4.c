@@ -65,6 +65,7 @@
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <unistd.h>
 #endif
+#include <pthread.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -354,6 +355,10 @@ typedef struct {
  * overwrites the slab -- no malloc/free on the hot path. */
 typedef struct {
     int layer, eid;
+    /* 0 = empty, 1 = load in flight (async pool), 2 = ready. The async
+     * reader threads set 2 under the pool lock, which is also the happens-
+     * before edge for the W views they wrote into `base`. */
+    volatile int state;
     W w1,w3,w2;
     uint64_t used;
     uint8_t *base; size_t base_cap;
@@ -480,6 +485,11 @@ static int is_stop(int id){
     for(int i=0;i<g_nstop;i++) if(g_stop[i]==id) return 1;
     return 0;
 }
+
+/* async expert pool (defined after expert_slot_pread) -- forward decls so
+ * model_load and main can start/stop it */
+static void expert_pool_start(Model *m);
+static void expert_pool_stop(void);
 
 static void model_load(Model *m, const char *dir){
     double t0=now_s();
@@ -746,6 +756,9 @@ static void model_load(Model *m, const char *dir){
     m->itop    =(int*)xalloc((size_t)(g_max_seq/4+8)*sizeof(int),"indexer topk");
     m->hpf_eid =(int*)xalloc((size_t)c->n_routed_experts*sizeof(int),"hash prefetch eid");
     m->hpf_seen=(unsigned char*)xzalloc((size_t)c->n_routed_experts,"hash prefetch seen");
+
+    /* Async expert reader pool (decode only; prefill stays synchronous). */
+    expert_pool_start(m);
 }
 
 /* --------------------------------------------------------- expert streaming
@@ -775,8 +788,10 @@ static void expert_prefetch(Model *m, int layer, const int *eids, int n){
         if(eids[j]<0) continue;
         ExRef *er=&m->xref[(int64_t)layer*m->c.n_routed_experts+eids[j]];
         if(er->fd[0]<0) continue;
-        if(er->contig){ if(er->fd[0]>=0) posix_fadvise(er->fd[0],er->off[0],m->e_slot,POSIX_FADV_WILLNEED); }
-        else for(int k=0;k<6;k++) if(er->fd[k]>=0) posix_fadvise(er->fd[k],er->off[k],sizes[k],POSIX_FADV_WILLNEED);
+        /* st_willneed: F_RDADVISE on macOS (where posix_fadvise is a no-op
+         * stub), POSIX_FADV_WILLNEED elsewhere. */
+        if(er->contig){ if(er->fd[0]>=0) st_willneed(er->fd[0],er->off[0],m->e_slot); }
+        else for(int k=0;k<6;k++) if(er->fd[k]>=0) st_willneed(er->fd[k],er->off[k],sizes[k]);
     }
 }
 
@@ -818,8 +833,13 @@ static void hash_prefetch(Model *m, Layer *L, const int *ids, int C){
 
 /* Load expert (layer,eid) into slot v's slab and point the three W views at
  * it. The W geometry is fixed for all routed experts, so the slab is
- * allocated once per slot (lazily). Mirrors kimi_k3.c's expert_read. */
-static void expert_load_slot(Model *m, ESlot *v, int layer, int eid){
+ * allocated once per slot (lazily). Mirrors kimi_k3.c's expert_read.
+ *
+ * PURE I/O: touches only v's own slab, never shared counters -- the async
+ * pool calls it from reader threads and does the bookkeeping (clock, miss,
+ * state=ready) under the pool lock after it returns. The sync path calls it
+ * from expert_get and does the same bookkeeping itself. */
+static void expert_slot_pread(Model *m, ESlot *v, int layer, int eid){
     if(!v->base){
         if(posix_memalign((void**)&v->base,4096,(size_t)m->e_slot+8192)){
             fprintf(stderr,"OOM expert slot\n"); exit(1); }
@@ -885,7 +905,7 @@ static void expert_load_slot(Model *m, ESlot *v, int layer, int eid){
     w3->b=base+m->e_w1p+m->e_w1s;        w3->e8=base+m->e_w1p+m->e_w1s+m->e_w1p;
     w2->b=base+m->e_w1p+m->e_w1s+m->e_w1p+m->e_w1s;      w2->e8=base+m->e_w1p+m->e_w1s+m->e_w1p+m->e_w1s+m->e_w2p;
 
-    v->layer=layer; v->eid=eid; v->used=++m->clock; m->expert_miss++;
+    v->layer=layer; v->eid=eid;
     if(layer==0 && eid==0 && getenv("DSV4_DEBUG"))
         fprintf(stderr,"[E0] contig=%d w1.b[0..3]=%u,%u,%u,%u w1.e8[0]=%u w2.b[0..3]=%u,%u,%u,%u w2.e8[0]=%u\n",
                 er->contig,w1->b[0],w1->b[1],w1->b[2],w1->b[3],w1->e8[0],
@@ -893,20 +913,140 @@ static void expert_load_slot(Model *m, ESlot *v, int layer, int eid){
 }
 
 static void expert_get(Model *m, int layer, int eid, W **w1, W **w3, W **w2){
-    for(int s=0;s<m->n_eslot;s++) if(m->eslot[s].layer==layer && m->eslot[s].eid==eid){
-        m->eslot[s].used=++m->clock; m->expert_hits++;
-        *w1=&m->eslot[s].w1; *w3=&m->eslot[s].w3; *w2=&m->eslot[s].w2; return;
-    }
+    for(int s=0;s<m->n_eslot;s++)
+        if(m->eslot[s].state==2 && m->eslot[s].layer==layer && m->eslot[s].eid==eid){
+            m->eslot[s].used=++m->clock; m->expert_hits++;
+            *w1=&m->eslot[s].w1; *w3=&m->eslot[s].w3; *w2=&m->eslot[s].w2; return;
+        }
     int victim=0;
     for(int s=0;s<m->n_eslot;s++){
-        if(m->eslot[s].eid<0){ victim=s; break; }
-        if(m->eslot[s].used<m->eslot[victim].used) victim=s;
+        if(m->eslot[s].state==0){ victim=s; break; }
+        if(m->eslot[s].state!=1 && m->eslot[s].used<m->eslot[victim].used) victim=s;
     }
     ESlot *v=&m->eslot[victim];
     double t0=now_s();
-    expert_load_slot(m,v,layer,eid);
+    expert_slot_pread(m,v,layer,eid);
+    v->state=2; v->used=++m->clock; m->expert_miss++;
     m->expert_load_s += now_s()-t0;
     *w1=&v->w1; *w3=&v->w3; *w2=&v->w2;
+}
+
+/* -------------------------------------------------------- async expert pool
+ * macOS has no working POSIX_FADV_WILLNEED (it is a stub returning ENOSYS),
+ * and F_RDADVISE warms too late to hide the demand pread. The decode profile
+ * showed the main thread sitting in pread ~34% of samples while every OpenMP
+ * worker idled in its fork barrier: the disk runs at a queue depth of one
+ * synchronous read, which caps throughput far below what the SSD does (7 GB/s
+ * sequential here) and serializes every load against the compute that follows.
+ *
+ * So decode loads its K experts per layer through a small reader pool:
+ * moe() reserves the slots and enqueues all K loads under one lock, then
+ * waits for each in route order. The reader threads issue the preads
+ * CONCURRENTLY -- real queue depth, reads overlapping the expert matmuls.
+ * Same bytes, same W views, same accumulation order, so the logits are
+ * bit-identical to the synchronous path; only the I/O timing differs (the
+ * numpy-oracle fixture pins this).
+ *
+ * Prefill keeps the synchronous expert_get: it already loads its working set
+ * in disk-offset order and is not the decode bottleneck. */
+static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_pool_cv = PTHREAD_COND_INITIALIZER; /* job available */
+static pthread_cond_t  g_slot_cv = PTHREAD_COND_INITIALIZER; /* slot ready */
+static Model *g_pool_m = NULL;
+static int g_pool_stop = 0;
+static int g_pool_nth = 0;
+static pthread_t *g_pool_th = NULL;
+/* job ring: slot index + (layer,eid) to load into it */
+static int *g_job_slot = NULL, *g_job_layer = NULL, *g_job_eid = NULL;
+static int g_job_cap = 0, g_job_head = 0, g_job_tail = 0, g_job_n = 0;
+
+static void *expert_pool_thread(void *arg){
+    (void)arg;
+    for(;;){
+        pthread_mutex_lock(&g_pool_mu);
+        while(g_job_n==0 && !g_pool_stop) pthread_cond_wait(&g_pool_cv,&g_pool_mu);
+        if(g_pool_stop && g_job_n==0){ pthread_mutex_unlock(&g_pool_mu); return NULL; }
+        int s=g_job_slot[g_job_head], layer=g_job_layer[g_job_head], eid=g_job_eid[g_job_head];
+        g_job_head=(g_job_head+1)%g_job_cap; g_job_n--;
+        pthread_mutex_unlock(&g_pool_mu);
+
+        Model *m=g_pool_m; ESlot *v=&m->eslot[s];
+        double t0=now_s();
+        expert_slot_pread(m,v,layer,eid);
+        double dt=now_s()-t0;
+
+        pthread_mutex_lock(&g_pool_mu);
+        v->state=2; v->used=++m->clock; m->expert_miss++;
+        m->expert_load_s += dt;
+        pthread_cond_broadcast(&g_slot_cv);
+        pthread_mutex_unlock(&g_pool_mu);
+    }
+}
+
+/* Reserve slots for a layer's experts and enqueue their loads; returns through
+ * `slots` one slot index per entry of `eids` (duplicates reuse one slot). The
+ * loads then run in the reader threads; the caller waits per-expert. */
+static void expert_begin(Model *m, int layer, const int *eids, int n, int *slots){
+    pthread_mutex_lock(&g_pool_mu);
+    for(int i=0;i<n;i++){
+        int e=eids[i], s=-1;
+        for(int k=0;k<m->n_eslot;k++)
+            if(m->eslot[k].state!=0 && m->eslot[k].layer==layer && m->eslot[k].eid==e){ s=k; break; }
+        if(s<0){
+            int victim=-1; uint64_t vu=~0ULL;
+            for(int k=0;k<m->n_eslot;k++){
+                ESlot *v=&m->eslot[k];
+                if(v->state==1) continue;                 /* in flight */
+                if(v->state==0){ victim=k; break; }        /* empty */
+                if(v->used<vu){ vu=v->used; victim=k; }    /* LRU */
+            }
+            /* n_eslot >= n_layers, and a layer routes <= 64 experts, so a
+             * victim always exists with at most 64 slots in flight. */
+            if(victim<0){ fprintf(stderr,"[DSV4] expert pool exhausted\n"); exit(1); }
+            s=victim;
+            m->eslot[s].state=1;
+            g_job_slot[g_job_tail]=s; g_job_layer[g_job_tail]=layer; g_job_eid[g_job_tail]=e;
+            g_job_tail=(g_job_tail+1)%g_job_cap; g_job_n++;
+        }
+        slots[i]=s;
+    }
+    pthread_cond_broadcast(&g_pool_cv);
+    pthread_mutex_unlock(&g_pool_mu);
+}
+
+/* Wait for slot s to be ready and return its W views (hits bump the clock
+ * like the sync path; the first miss was already counted at enqueue). */
+static void expert_wait(Model *m, int s, W **w1, W **w3, W **w2){
+    ESlot *v=&m->eslot[s];
+    pthread_mutex_lock(&g_pool_mu);
+    while(v->state!=2) pthread_cond_wait(&g_slot_cv,&g_pool_mu);
+    v->used=++m->clock; m->expert_hits++;
+    pthread_mutex_unlock(&g_pool_mu);
+    *w1=&v->w1; *w3=&v->w3; *w2=&v->w2;
+}
+
+static void expert_pool_start(Model *m){
+    int nth=4;
+    const char *e=getenv("DSV4_POOL");
+    if(e) nth=atoi(e);
+    if(nth<=0) return;
+    if(getenv("DSV4_NO_ASYNC")) return;
+    g_pool_m=m;
+    g_job_cap=m->n_eslot+64;   /* room for a layer's whole expert batch */
+    g_job_slot =(int*)xalloc((size_t)g_job_cap*sizeof(int),"pool slot ring");
+    g_job_layer=(int*)xalloc((size_t)g_job_cap*sizeof(int),"pool layer ring");
+    g_job_eid  =(int*)xalloc((size_t)g_job_cap*sizeof(int),"pool eid ring");
+    g_pool_nth=nth;
+    g_pool_th=(pthread_t*)xalloc((size_t)nth*sizeof(pthread_t),"pool threads");
+    for(int i=0;i<nth;i++) pthread_create(&g_pool_th[i],NULL,expert_pool_thread,NULL);
+}
+
+static void expert_pool_stop(void){
+    if(!g_pool_nth) return;
+    pthread_mutex_lock(&g_pool_mu); g_pool_stop=1;
+    pthread_cond_broadcast(&g_pool_cv); pthread_mutex_unlock(&g_pool_mu);
+    for(int i=0;i<g_pool_nth;i++) pthread_join(g_pool_th[i],NULL);
+    g_pool_nth=0;
 }
 
 /* ------------------------------------------------------------ compressor */
@@ -1078,29 +1218,24 @@ static void attention(Model *m, Layer *L, const float *xin, int pos, float *out)
         dsv4_rope_apply(m->attn_out+(size_t)h*HD+HD-rd,rd,pos,L->freqs,1);
 
     /* Grouped output LoRA: wo_a applies PER GROUP over hs/o_groups slices,
-     * then wo_b maps the concatenated ranks back to dim. */
+     * then wo_b maps the concatenated ranks back to dim. wo_a is stored
+     * [G*R, gin]; group g owns rows [g*R, (g+1)*R) against attn_out's g-th
+     * gin slice. This was a hand-rolled scalar e4m3 loop -- and the decode
+     * profile flagged it as ~14 s/token, more than everything else combined.
+     * It is exactly the fp8 kernel's block structure, so each group is a
+     * matmul_fp8 call: NEON on ARM, OpenMP across its R rows, same LUT and
+     * same block scaling (scalar path bit-identical; NEON changes only the
+     * intra-block accumulation order, like every other fp8 matmul here).
+     * The scale array is indexed by absolute row, so the per-group slice
+     * starts at block row (g*R)/128. */
     int G=c->o_groups, gin=hs/G, R=c->o_lora_rank;
     float *proj=(float*)xalloc((size_t)G*R*sizeof(float),"o proj");
     for(int g=0;g<G;g++){
-        const float *src=m->attn_out+(size_t)g*gin;
-        const uint8_t *wb=L->wo_a.b+(size_t)g*R*gin;
-        /* wo_a is stored [G*R, gin]; group g owns rows [g*R, (g+1)*R). The
-         * block-scale array is indexed by absolute row, so slice it by block
-         * row rather than by group. */
-        int64_t nblkI=dsv4_nblk128(gin);
-        for(int r=0;r<R;r++){
-            int64_t orow=(int64_t)g*R+r;
-            const uint8_t *w=wb+(size_t)r*gin;
-            const float *scl=L->wo_a.s+(orow/128)*nblkI;
-            double a=0;
-            for(int64_t bi=0; bi*128<gin; bi++){
-                int b0=(int)(bi*128), bl=128; if(b0+bl>gin) bl=gin-b0;
-                float acc=0;
-                for(int i=b0;i<b0+bl;i++) acc+=e4m3_decode(w[i])*src[i];
-                a+=(double)acc*scl[bi];
-            }
-            proj[(size_t)g*R+r]=(float)a;
-        }
+        matmul_fp8(proj+(size_t)g*R,
+                   m->attn_out+(size_t)g*gin,
+                   L->wo_a.b+(size_t)g*R*gin,
+                   L->wo_a.s+(size_t)(g*R/128)*dsv4_nblk128(gin),
+                   1,gin,R);
     }
     w_matmul(&L->wo_b,out,proj,1);
     free(proj);
@@ -1123,15 +1258,19 @@ static void moe(Model *m, Layer *L, const float *xin, int token_id, float *out){
         n=dsv4_route(logits,L->gate_bias.f,E,K,c->norm_topk,c->route_scale,idx,wt);
     }
     free(logits);
-    /* Prefetch this token's experts before applying any: the router already
-     * picked them, so the WILLNEED lands while the first matmuls run (overlap
-     * with compute on the buffered path). */
-    expert_prefetch(m,(int)(L-m->L),idx,n);
+    /* Async pool active: reserve all K slots and enqueue their loads NOW, so
+     * the reader threads issue the preads concurrently (queue depth, reads
+     * overlapping the matmuls below). Sync fallback: WILLNEED the token's
+     * experts before applying any -- a hint only, no-op on macOS. */
+    int slots[64];
+    if(g_pool_nth) expert_begin(m,(int)(L-m->L),idx,n,slots);
+    else expert_prefetch(m,(int)(L-m->L),idx,n);
 
     memset(out,0,(size_t)D*sizeof(float));
     for(int i=0;i<n;i++){
         W *w1,*w3,*w2;
-        expert_get(m,(int)(L-m->L),idx[i],&w1,&w3,&w2);
+        if(g_pool_nth) expert_wait(m,slots[i],&w1,&w3,&w2);
+        else expert_get(m,(int)(L-m->L),idx[i],&w1,&w3,&w2);
         w_matmul(w1,m->ffn_g,xin,1);
         w_matmul(w3,m->ffn_u,xin,1);
         dsv4_swiglu(m->ffn_g,m->ffn_g,m->ffn_u,MI,c->swiglu_limit);
@@ -1672,8 +1811,10 @@ int main(int argc, char **argv){
                 n_ids-1,pre,pre/(n_ids-1));
     fprintf(stderr,"  decode:  %d tokens in %.1fs (%.2f tok/s)%s\n",
             gen,dt,dt>0?gen/dt:0.0, hit_stop?" [stopped at eos]":"");
-    fprintf(stderr,"  experts: %llu hit / %llu miss, %.1fs loading\n",
-            (unsigned long long)m.expert_hits,(unsigned long long)m.expert_miss,m.expert_load_s);
+    fprintf(stderr,"  experts: %llu hit / %llu miss, %.1fs loading%s\n",
+            (unsigned long long)m.expert_hits,(unsigned long long)m.expert_miss,m.expert_load_s,
+            g_pool_nth ? " (async pool)" : "");
+    expert_pool_stop();
     free(ids);
     return 0;
 }
