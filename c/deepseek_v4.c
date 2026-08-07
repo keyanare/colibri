@@ -104,6 +104,7 @@ static int   g_max_seq     = 8192;    /* cache sizing; config's 1M would need
                                        * ~GBs of KV per layer and is not a
                                        * useful default for a first run */
 static int   g_verbose     = 1;
+static int   g_timing      = 0;      /* --timing: per-stage decode time breakdown */
 static int   g_preflight   = 0;      /* --preflight: check the checkpoint, load nothing */
 static int   g_ids_mode    = 0;      /* --ids: token ids given directly, no tokenizer */
 static const char *g_dump  = NULL;   /* --dump-logits: oracle output for the fixture */
@@ -387,6 +388,11 @@ typedef struct {
     uint64_t clock;
     uint64_t expert_hits, expert_miss;
     double expert_load_s;
+    /* per-stage decode timing (see --timing): where the per-token wall time
+     * actually goes -- attention vs expert-wait (disk) vs expert matmul vs
+     * the head's big dense projection. */
+    double t_att, t_wait, t_exp, t_head, t_ffn_other;
+    double t_qkv, t_comp, t_idx, t_spa, t_wo;
     float *embrow;   /* one embedding row, read per token instead of resident */
     /* scratch, sized once */
     float *x;        /* [hc_mult][dim] residual streams */
@@ -1163,6 +1169,8 @@ static void attention(Model *m, Layer *L, const float *xin, int pos, float *out)
     /* Q: LoRA down, norm, up, then an UNWEIGHTED per-head RMS, then RoPE on
      * the trailing rd dims. The per-head normalize has no learned parameter --
      * it is not q_norm, which already ran on the rank-1024 vector. */
+    double t0;
+    t0=now_s();
     float *qr=(float*)xalloc((size_t)c->q_lora_rank*sizeof(float),"qr");
     w_matmul(&L->wq_a,qr,xin,1);
     rmsnorm(qr,qr,L->q_norm.f,c->q_lora_rank,c->norm_eps);
@@ -1180,6 +1188,7 @@ static void attention(Model *m, Layer *L, const float *xin, int pos, float *out)
     rmsnorm(m->kv,m->kv,L->kv_norm.f,HD,c->norm_eps);
     dsv4_rope_apply(m->kv+HD-rd,rd,pos,L->freqs,0);
     memcpy(L->kv_cache+(size_t)(pos % c->window_size)*HD,m->kv,(size_t)HD*sizeof(float));
+    m->t_qkv += now_s()-t0;
 
     /* index set: sliding window, then compressed positions */
     int n_idx=0;
@@ -1187,14 +1196,18 @@ static void attention(Model *m, Layer *L, const float *xin, int pos, float *out)
     for(int p=win_lo;p<=pos;p++) m->idxbuf[n_idx++]=(int32_t)(p % c->window_size);
 
     if(L->ratio){
+        t0=now_s();
         compressor_step(m,&L->comp,xin,pos);
         if(L->idx.active) compressor_step(m,&L->idx.comp,xin,pos);
+        m->t_comp += now_s()-t0;
         int base=c->window_size;
         if(L->idx.active){
+            t0=now_s();
             int32_t *sel=m->idxbuf+n_idx;
             int ns=indexer_select(m,L,qr,xin,pos,sel);
             for(int i=0;i<ns;i++) sel[i]+=base;
             n_idx+=ns;
+            m->t_idx += now_s()-t0;
         } else {
             for(int t=0;t<L->comp.n_cached && n_idx<m->idxcap;t++)
                 m->idxbuf[n_idx++]=(int32_t)(base+t);
@@ -1209,6 +1222,7 @@ static void attention(Model *m, Layer *L, const float *xin, int pos, float *out)
     }
     free(qr);
 
+    t0=now_s();
     dsv4_sparse_attn(m->q,L->kv_cache,m->idxbuf,L->attn_sink.f,
                      H,HD,(int)L->kv_cache_rows,n_idx,
                      1.0f/sqrtf((float)HD),m->attn_out);
@@ -1216,6 +1230,7 @@ static void attention(Model *m, Layer *L, const float *xin, int pos, float *out)
     /* De-rotate: K and V are the same tensor, so the value side carried RoPE. */
     for(int h=0;h<H;h++)
         dsv4_rope_apply(m->attn_out+(size_t)h*HD+HD-rd,rd,pos,L->freqs,1);
+    m->t_spa += now_s()-t0;
 
     /* Grouped output LoRA: wo_a applies PER GROUP over hs/o_groups slices,
      * then wo_b maps the concatenated ranks back to dim. wo_a is stored
@@ -1228,6 +1243,7 @@ static void attention(Model *m, Layer *L, const float *xin, int pos, float *out)
      * intra-block accumulation order, like every other fp8 matmul here).
      * The scale array is indexed by absolute row, so the per-group slice
      * starts at block row (g*R)/128. */
+    t0=now_s();
     int G=c->o_groups, gin=hs/G, R=c->o_lora_rank;
     float *proj=(float*)xalloc((size_t)G*R*sizeof(float),"o proj");
     for(int g=0;g<G;g++){
@@ -1239,6 +1255,7 @@ static void attention(Model *m, Layer *L, const float *xin, int pos, float *out)
     }
     w_matmul(&L->wo_b,out,proj,1);
     free(proj);
+    m->t_wo += now_s()-t0;
 }
 
 /* -------------------------------------------------------------------- moe */
@@ -1269,14 +1286,18 @@ static void moe(Model *m, Layer *L, const float *xin, int token_id, float *out){
     memset(out,0,(size_t)D*sizeof(float));
     for(int i=0;i<n;i++){
         W *w1,*w3,*w2;
+        double t0=now_s();
         if(g_pool_nth) expert_wait(m,slots[i],&w1,&w3,&w2);
         else expert_get(m,(int)(L-m->L),idx[i],&w1,&w3,&w2);
+        m->t_wait += now_s()-t0;
+        t0=now_s();
         w_matmul(w1,m->ffn_g,xin,1);
         w_matmul(w3,m->ffn_u,xin,1);
         dsv4_swiglu(m->ffn_g,m->ffn_g,m->ffn_u,MI,c->swiglu_limit);
         for(int j=0;j<MI;j++) m->ffn_g[j]*=wt[i];
         w_matmul(w2,m->ffn_o,m->ffn_g,1);
         for(int d=0;d<D;d++) out[d]+=m->ffn_o[d];
+        m->t_exp += now_s()-t0;
     }
     if(c->n_shared_experts){
         w_matmul(&L->sh_w1,m->ffn_g,xin,1);
@@ -1299,7 +1320,7 @@ static void block(Model *m, int l, int pos, int token_id){
     dsv4_hc_pre(m->x,HC,D,L->hc_attn_fn.f,L->hc_attn_scale.f,L->hc_attn_base.f,
                 c->hc_sinkhorn_iters,c->hc_eps,c->norm_eps,m->h,pre,post,comb);
     rmsnorm(m->hn,m->h,L->attn_norm.f,D,c->norm_eps);
-    attention(m,L,m->hn,pos,m->h);
+    { double t0=now_s(); attention(m,L,m->hn,pos,m->h); m->t_att += now_s()-t0; }
     dsv4_hc_post(m->h,m->xres,post,comb,HC,D,m->x);
 
     memcpy(m->xres,m->x,(size_t)HC*D*sizeof(float));
@@ -1333,7 +1354,7 @@ static void forward(Model *m, int token_id, int pos){
     dsv4_hc_collapse(m->x,HC,D,m->hc_head_fn.f,m->hc_head_scale.f[0],
                      m->hc_head_base.f,c->hc_eps,c->norm_eps,m->h);
     rmsnorm(m->hn,m->h,m->norm.f,D,c->norm_eps);
-    w_matmul(&m->head,m->logits,m->hn,1);
+    { double t0=now_s(); w_matmul(&m->head,m->logits,m->hn,1); m->t_head += now_s()-t0; }
 }
 
 /* ----------------------------------------------------------------- prefill
@@ -1709,6 +1730,7 @@ int main(int argc, char **argv){
         else if(!strcmp(argv[i],"--chunk")  &&i+1<argc) g_chunk=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--direct")) g_direct=1;
         else if(!strcmp(argv[i],"--quiet")) g_verbose=0;
+        else if(!strcmp(argv[i],"--timing")) g_timing=1;
         else if(!strcmp(argv[i],"--ids")) g_ids_mode=1;
         else if(!strcmp(argv[i],"--preflight")) g_preflight=1;
         else if(!strcmp(argv[i],"--dump-logits") && i+1<argc) g_dump=argv[++i];
@@ -1814,6 +1836,20 @@ int main(int argc, char **argv){
     fprintf(stderr,"  experts: %llu hit / %llu miss, %.1fs loading%s\n",
             (unsigned long long)m.expert_hits,(unsigned long long)m.expert_miss,m.expert_load_s,
             g_pool_nth ? " (async pool)" : "");
+    if(g_timing && gen>0){
+        fprintf(stderr,"  decode stages (s/token, gen=%d):\n",gen);
+        fprintf(stderr,"    attention:  %.2f\n",m.t_att/gen);
+        fprintf(stderr,"      qkv:      %.2f   (wq_a/wq_b/wkv + norms + rope)\n",m.t_qkv/gen);
+        fprintf(stderr,"      comp:     %.2f   (compressor steps)\n",m.t_comp/gen);
+        fprintf(stderr,"      indexer:  %.2f   (indexer_select)\n",m.t_idx/gen);
+        fprintf(stderr,"      sparse:   %.2f   (dsv4_sparse_attn + derotate)\n",m.t_spa/gen);
+        fprintf(stderr,"      wo:       %.2f   (wo_a scalar + wo_b)\n",m.t_wo/gen);
+        fprintf(stderr,"    exp wait:   %.2f   (disk: reading experts)\n",m.t_wait/gen);
+        fprintf(stderr,"    exp matmul: %.2f\n",m.t_exp/gen);
+        fprintf(stderr,"    head:       %.2f\n",m.t_head/gen);
+        double other=dt - (m.t_att+m.t_wait+m.t_exp+m.t_head);
+        fprintf(stderr,"    other:      %.2f   (hc gates, norms, routing, embed)\n",other/gen);
+    }
     expert_pool_stop();
     free(ids);
     return 0;
