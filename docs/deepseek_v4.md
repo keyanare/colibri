@@ -11,14 +11,16 @@ An engine for [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4
 > between "self-consistent" and "correct" is a token-exact oracle on real
 > weights, and that has not been run.
 >
-> **It now runs on the real `-0731` checkpoint** (2026-08-03). `--preflight`
-> matches 34223/34223 names and shapes; a 197-token prompt — past the 128
-> sliding window, so the CSA and HCA paths carry it — produces coherent,
-> in-context continuation. **That is not correctness.** Nothing has been
-> compared against a reference implementation on real weights: a subtly wrong
-> compressed path, a tie broken the other way in the indexer's top-512, or an
-> off-by-one in the compressor's prefill would all still read as fluent text.
-> The token-exact oracle remains the only thing that would close it.
+> **It now runs on the real `-0731` checkpoint.** `--preflight` matches
+> 34223/34223 names and shapes, and short prompts produce coherent continuation
+> (12 tokens on an Apple M5, 10 on an AMD Ryzen 7 H 255 under WSL). **That is
+> not correctness.** Neither run passes the 128-token sliding window, so the
+> CSA/HCA long-context paths have never been exercised on real weights.
+> Nothing has been compared against a reference implementation on real
+> weights: a subtly wrong compressed path, a tie broken the other way in the
+> indexer's top-512, or an off-by-one in the compressor's prefill would all
+> still read as fluent text. The token-exact oracle remains the only thing
+> that would close it.
 
 ---
 
@@ -222,23 +224,33 @@ The engine is I/O-bound, and on any machine where the expert cache is smaller
 than a few percent of a layer's 256 experts, essentially every token streams its
 whole working set: **6 experts × 43 layers × 13.4 MB ≈ 3.4 GB read per token**.
 
-| | Apple M5, 16 GB, ~5 GB/s SSD | i7-11700, 32 GB, 3 GB/s NVMe |
+The only real runs so far — both short prompts, both CPU-only (there is **no
+CUDA or Metal backend for this engine**):
+
+| | Apple M5 (macOS) | Lenovo Lecoo, WSL (Ryzen 7 H 255, 32 GB, NVMe) |
 |---|---|---|
 | resident | ~8.0 GB | ~8.0 GB |
-| expert cache | 3–4 GB (~5 experts/layer) | ~20 GB (~35 experts/layer) |
+| expert cache | 8 GB (`--expert-gb 8`) | 3.5 GB (`--expert-gb 3.5`) |
 | expert kernels | NEON (I%32==0) | AVX2 |
-| estimate | ~1.5–3 s/token | **measured: 3.8 s/token prefill, 4.0 s/token decode** (`--expert-gb 3.5`, 197-token prompt) |
+| threads (OMP) | 4 physical of 10 logical | 8 physical of 16 logical |
+| prefill | 6.1 s/token | 4.0 s/token |
+| decode | **0.03 tok/s** (~37.6 s/token) | **0.27 tok/s** (~3.7 s/token) |
+| prompt | 12 tokens, Pushkin | 10 tokens, chat template |
 
-They land in the same place for different reasons: the Mac has a faster SSD but
-a cache too small to help; the PC has a usable cache but half the bandwidth.
-Neither has a GPU path — **there is no CUDA or Metal backend for this engine.**
+The Mac is an order of magnitude slower despite the bigger cache. Two causes,
+visible in the runs: it decodes on 4 physical threads (the Lenovo uses 8), and
+its effective disk throughput measured ~220 MB/s against the same ~3.4 GB-per-
+token working set — the Lenovo reads at several GB/s. Both caches thrash
+(43% and 53% miss respectively), so neither is close to the resident limit
+this engine is built for; a fully resident run has not happened anywhere yet.
 
 Prefill runs **layer-major over chunks of `--chunk` tokens** (default 32), so
 each unique expert is read once per layer per chunk and applied to every token
-that routed to it. Token-at-a-time cost 3.8 s/token — 12 minutes for a
-197-token prompt — because a token's six experts per layer were read for that
-token alone. The ceiling is now 256 reads per layer per chunk however long the
-chunk is, and the head is skipped for prompt tokens.
+that routed to it. Token-at-a-time is the fallback (`--chunk 1`): a token's six
+experts per layer are then read for that token alone. The ceiling is 256 reads
+per layer per chunk however long the chunk is, and the head is skipped for
+prompt tokens. Measured prefill: 6.1 s/token (Mac) and 4.0 s/token (Lenovo),
+both 10–12-token prompts on cold caches.
 
 The batching is **bit-identical** to `--chunk 1`, on purpose: the sequential
 state still advances one token at a time inside each layer, the dense matmuls

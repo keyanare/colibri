@@ -1203,11 +1203,11 @@ static void forward(Model *m, int token_id, int pos){
  * it. Same shape as kimi_k3.c's step_chunk.
  *
  * WHY. forward() walks one token through all 43 layers, so a token's six
- * experts per layer are read for that token alone: ~3.4 GB per PROMPT token,
- * and a 197-token prompt spent 744 s here with nothing on stdout. Every token
- * of the prompt passes through the same weights, so inverting the loops lets
- * one read serve every token that wanted it. The ceiling is 256 reads per layer
- * per chunk (the whole expert grid) no matter how long the chunk is.
+ * experts per layer are read for that token alone: ~3.4 GB per PROMPT token
+ * (measured prefill is 4-6 s/token on short prompts, most of it here). Every
+ * token of the prompt passes through the same weights, so inverting the loops
+ * lets one read serve every token that wanted it. The ceiling is 256 reads per
+ * layer per chunk (the whole expert grid) no matter how long the chunk is.
  *
  * BIT-IDENTICAL to the token-at-a-time path, deliberately:
  *   - the sequential state (kv ring, the compressor's rolling window, the
