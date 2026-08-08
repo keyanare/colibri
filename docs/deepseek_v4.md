@@ -70,12 +70,14 @@ c/dsv4_model.h                  config parsing + tensor manifest (unit tested)
 c/deepseek_v4.c                 the engine
 c/tok_unicode_dsv4.h            generated \p{P} \p{S} \p{M} tables
 c/tools/make_tiny_dsv4.py       synthetic checkpoint + numpy oracle
+c/tools/dsv4_real_oracle.py     numpy oracle on the REAL checkpoint (reads the 48 shards)
 c/tools/dsv4_tokenizer.py       vocabulary validator + HF cross-check
 c/tools/dsv4_doctor.py          hardware readiness check
 c/tools/gen_unicode_dsv4.py     regenerates tok_unicode_dsv4.h
 c/tests/test_dsv4.c             17 primitive tests
 c/tests/test_dsv4_model.c       manifest / shape tests
 c/tests/test_dsv4_fixture.py    end-to-end vs the numpy oracle
+c/tests/test_dsv4_real_oracle.py  real-weight oracle (skips when no checkpoint)
 c/tests/test_dsv4_tokenizer.py  validator tests (mostly negative)
 c/tests/test_tok_dsv4.c         tok.h vs HF tokenizers harness
 ```
@@ -213,6 +215,25 @@ tensors it does not cover (the MTP head) as expected rather than as corruption.
 
 `dsv4_doctor.py` suggests an `--expert-gb` that fits your RAM.
 
+### 4. The real-weight oracle
+
+```bash
+# 1. engine logits on the real checkpoint (short prompt -- the reference is slow)
+./c/deepseek_v4 /nvme/dsv4 "0,1,2,3,4" --ids --ngen 1 \
+    --dump-logits got.json --quiet
+# 2. independent numpy reference on the same prompt, then compare
+python3 c/tools/dsv4_real_oracle.py /nvme/dsv4 \
+    --ids 0,1,2,3,4 --ngen 1 --check got.json
+```
+
+The tool reads the 48 shards with the same byte semantics as the engine
+(`data_offsets` relative to the data section, e4m3 + ue8m0 per 128×128, mxfp4
+nibbles + ue8m0 per 32, bf16, i64→i32 narrowing), runs `RefModel` (the same
+numpy forward as the fixture) on the real weights, and requires small rel-L2
+plus identical argmax on every step. `test_dsv4_real_oracle.py` gates it and
+skips loudly when the checkpoint is absent (`DSV4_REAL_CHECKPOINT`). At
+~20 s/token of reference compute on the 43-layer model, keep the prompt short.
+
 ---
 
 ## Hardware
@@ -268,12 +289,21 @@ not free in that sense — it changes reduction order.
 |---|---|
 | shapes and tensor wiring | the derived manifest reproduces DeepSeek's own published figures: **284.3B** parameters (published 284B), **13.3B** active (published 13B), **155 GB** on disk (published 160 GB), 97.4% in routed experts. None of those numbers were used to build the manifest. |
 | the whole forward pass | a synthetic checkpoint in the real on-disk format, run through the engine and an independent numpy implementation: **rel-L2 1.0e-05**, argmax identical on every step. `make test-python` (needs numpy). |
+| the whole forward pass on REAL weights | `tools/dsv4_real_oracle.py` reads the 48 shards, decodes e4m3/mxfp4/bf16 with the same byte semantics as the engine, and runs the same numpy reference on the real `-0731` checkpoint: **rel-L2 ~4e-07, argmax identical** on every step (5- and 13-token prompts). The first time engine logits have been compared to anything computed from the real weight bytes. Gated in `test_dsv4_real_oracle.py`, which skips loudly when the checkpoint is absent. |
 | tokenizer | **356/356** cases match HF `tokenizers` on the real vocabulary — punctuation, contractions, CJK, Korean, Thai, Arabic, Hebrew, Cyrillic, combining marks, ZWJ emoji, CRLF, URLs, code, 200 random strings. Forced down the `cl100k` path the same vocabulary scores **341/356**, which is why the fourth family exists. |
 | primitives | 18 test groups, most of them aimed at a specific way a plausible reimplementation goes wrong (untransposed `comb`, symmetric SwiGLU clamp, sink folded into the loop, per-token instead of per-dimension pooling, and the MXFP4 SIMD decode vs the undoubled e2m1 LUT). |
 
 **What none of this proves:** that the architecture was transcribed correctly.
 The engine and the numpy oracle were written from the same reading of the same
-file; a shared misreading passes both.
+file; a shared misreading passes both. The real-weight oracle (above) closes
+the byte-decode and streaming half of that gap — the engine now demonstrably
+reproduces an independent float64 reference from the real weight bytes — but
+not the transcription half: both sides still read `inference/model.py` the
+same way, and only running DeepSeek's own torch reference (torch+tilelang+CUDA,
+155 GB in GPU memory) would settle that. As a check on the decode side it has
+already caught one real defect: the first cut of the oracle read safetensors
+`data_offsets` relative to file start instead of to the data section, so
+byte-reading bugs ARE the class this tool is built to find.
 
 Three real defects were caught this way, which is the argument for the harness:
 
@@ -355,8 +385,14 @@ Three real defects were caught this way, which is the argument for the harness:
    a hint only — never changes what is read, so the logits are byte-identical
    (the fixture's hash-routed layer 0 exercises both paths; `[HASH]` lines under
    `DSV4_DEBUG` show the union size). `--direct` skips it like every prefetch.
-6. **A token-exact oracle** on the real checkpoint. Everything above is
-   provisional until this exists.
+6. ⏳ **DeepSeek's own torch reference on the real checkpoint.** Partially done
+   (2026-08-08): `tools/dsv4_real_oracle.py` runs the independent numpy
+   reference on the real weights and the engine matches to rel-L2 ~4e-07 with
+   identical argmax on every step — the byte-decode and streaming halves of the
+   gap are closed. What remains is the *transcription* half, which only the
+   published `inference/model.py` + `kernel.py` (torch+tilelang+CUDA, needs a
+   GPU machine that can hold 155 GB) can settle. Nothing else in this repository
+   is implementation-independent of this fork's reading of that file.
 
 ---
 

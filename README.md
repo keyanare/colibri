@@ -18,9 +18,11 @@ parameters** — on consumer and heterogeneous hardware, in pure C with zero
 engine dependencies, by treating storage, RAM, and VRAM as one inference
 hierarchy.
 
-Four families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
-(2.8T) and **OLMoE** (7B) — one C file each, the same `coli chat` /
-`coli serve` / `coli web` front end. [Full roster ↓](#other-supported-models)
+Five engines run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
+(2.8T), **OLMoE** (7B) and **DeepSeek-V4-Flash** (284B) — one C file each.
+The first four share the same `coli chat` / `coli serve` / `coli web` front end;
+the DeepSeek-V4 engine is a standalone binary run directly.
+[Full roster ↓](#other-supported-models)
 
 > **Colibrì is an inference engine you can run today, and an open research
 > platform.** Its primary goal is to pursue inference-side performance across
@@ -357,10 +359,11 @@ the full 756 GB on disk at once:
 
 #### Other supported models
 
-GLM-5.2 is the reference model, but the same streaming approach runs three more
-families. Each is a **sibling engine** — one C file, its own architecture, the same
-`coli chat` / `coli serve` / `coli web` front end (the launcher picks the binary from
-the model's `config.json`):
+GLM-5.2 is the reference model, but the same streaming approach runs four more
+families. Each is a **sibling engine** — one C file, its own architecture (the launcher
+picks the binary from the model's `config.json`); the first four share the
+`coli chat` / `coli serve` / `coli web` front end, while DeepSeek-V4-Flash is a
+standalone binary — see its own section below:
 
 | Family | Total / active | Weights | Build | Docs |
 |---|---|---|---|---|
@@ -368,6 +371,7 @@ the model's `config.json`):
 | **Inkling** (Thinking Machines) | 975B / 41B | [`nbeerbower/Inkling-colibri-int4`](https://huggingface.co/nbeerbower/Inkling-colibri-int4) (469 GB) | `make -C c inkling` | [inkling.md](docs/inkling.md) |
 | **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
 | **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` | `make -C c olmoe` | — |
+| **DeepSeek-V4-Flash** (DeepSeek) | 284B / 13B | original checkpoint — QAT-trained **MXFP4** experts streamed byte-for-byte, bf16 dense set | `make -C c deepseek_v4 ARCH=native` | [deepseek_v4.md](docs/deepseek_v4.md) |
 
 Kimi K3 needs no conversion: its QAT-trained MXFP4 experts are streamed straight from
 the original Hugging Face shards, and the bf16 dense set is quantized at load time.
@@ -375,6 +379,28 @@ Inkling ships int4 experts but **bf16 dense weights** (49.4 GB resident); on a h
 that cannot hold those, [inkling.md](docs/inkling.md) has a one-pass tool that brings
 the dense set to 15.3 GB and lets the 975B run on a 25 GB box — with the honest
 trade-off written down.
+
+#### DeepSeek-V4-Flash
+
+A standalone engine (`c/deepseek_v4`, ~160 GB checkpoint, **1M context**) that does not
+go through the `coli` launcher. It streams QAT-trained **MXFP4** experts byte-for-byte
+from the original checkpoint — no conversion step — and runs the whole forward pass in
+C: 43 layers, shared-KV attention, CSA/HCA compressed context, and the hash-routed
+first layers. Run it directly with `make -C c deepseek_v4 ARCH=native` then
+`./c/deepseek_v4 <model_dir> "prompt" --expert-gb 8 --max-seq 8192 --ngen 64`.
+
+Platform support is **CPU-only** — no CUDA or Metal backend. It builds and runs on:
+
+- **Apple Silicon / macOS** — NEON paths for the MXFP4 expert kernel and the FP8
+  dense matmuls (base NEON, no DOTPROD/i8mm), 4 P-cores; `brew install libomp` first;
+- **x86-64 / Linux (incl. WSL)** — AVX2 MXFP4 kernel with `ARCH=native`; runs on any
+  Intel/AMD with enough RAM and disk bandwidth. Everything else falls back to scalar.
+
+The first three layers need no routing prediction (`tid2eid`), so their expert reads
+are known in advance and prefetched exactly. Status is honest: `--preflight` matches
+all 34223 tensor names/shapes against the real `-0731` checkpoint and short prompts
+produce coherent continuation, but the token-exact oracle against DeepSeek's own
+torch reference is still open — see [deepseek_v4.md](docs/deepseek_v4.md).
 
 ### 3. Run it
 
@@ -432,6 +458,7 @@ Two things that differ per model, both documented in the per-model page:
 | topic | doc |
 |---|---|
 | Benchmarks, community datapoints, quality measurements | [docs/benchmarks.md](docs/benchmarks.md) |
+| DeepSeek-V4-Flash engine (standalone, platforms, status) | [docs/deepseek_v4.md](docs/deepseek_v4.md) |
 | Tuning knobs, policies, the learning cache, prefetch | [docs/tuning.md](docs/tuning.md) |
 | Windows 11 native build (+ CUDA DLL) | [docs/windows.md](docs/windows.md) |
 | CUDA backend, VRAM expert tier, full residency | [docs/cuda.md](docs/cuda.md) |
@@ -472,6 +499,7 @@ today its numbers come from a community of real machines. If it's useful to you:
 Makefile                  root build/check entry point
 c/
 ├── glm.c                 single-file GLM engine
+├── deepseek_v4.c         single-file DeepSeek-V4 engine (with dsv4.h, dsv4_model.h)
 ├── st.h, tok.h, json.h   runtime headers
 ├── backend_cuda.*        optional CUDA tier
 ├── Makefile              build and local checks

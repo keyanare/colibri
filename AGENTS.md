@@ -50,6 +50,14 @@ PYTHON=/tmp/venv/bin/python make -C c test-python
   --quiet`, then `make_tiny_dsv4.py <dir> --check got.json`. **Bit-identical**
   is asserted — a tolerance there would mask a quiet reordering bug, don't
   relax it.
+- **Real-weight oracle** (token-exact on the real checkpoint): `python3
+  c/tools/dsv4_real_oracle.py <model_dir> --ids 0,1,2,3,4 --ngen 1 --check
+  got.json` runs the same numpy reference on the real weight bytes (rel-L2
+  ~4e-07, argmax identical). The checkpoint on this machine lives at
+  `/Users/keyanare/dsv4`; `test_dsv4_real_oracle.py` runs it when present and
+  skips loudly otherwise. Both this oracle and the engine read
+  `inference/model.py` the same way, so it does NOT close the transcription
+  gap — only DeepSeek's torch reference would.
 
 ## macOS gotchas (the machine this fork is developed on)
 
