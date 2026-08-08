@@ -251,18 +251,21 @@ CUDA or Metal backend for this engine**):
 | | Apple M5 (macOS) | Lenovo Lecoo, WSL (Ryzen 7 H 255, 32 GB, NVMe) |
 |---|---|---|
 | resident | ~8.0 GB | ~8.0 GB |
-| expert cache | 8 GB (`--expert-gb 8`) | 3.5 GB (`--expert-gb 3.5`) |
+| expert cache | 3.5 GB (`--expert-gb 3.5`) | 3.5 GB (`--expert-gb 3.5`) |
 | expert kernels | NEON (I%32==0) | AVX2 |
 | threads (OMP) | 4 physical of 10 logical | 8 physical of 16 logical |
-| prefill | 6.1 s/token | 4.0 s/token |
-| decode | **0.03 tok/s** (~37.6 s/token) | **0.27 tok/s** (~3.7 s/token) |
-| prompt | 12 tokens, Pushkin | 10 tokens, chat template |
+| prefill | 2.0 s/token (11 tok, 21.5 s) | 2.2 s/token (11 tok, 24.5 s) |
+| decode | **0.06 tok/s** (~16.4 s/token) | **0.60 tok/s** (~1.7 s/token) |
+| expert load | 94.5 s (3483 misses) | 64.2 s (3483 misses) |
+| prompt | 12 tokens, Pushkin | 12 tokens, Pushkin |
 
-The Mac is an order of magnitude slower despite the bigger cache. Two causes,
-visible in the runs: it decodes on 4 physical threads (the Lenovo uses 8), and
-its effective disk throughput measured ~220 MB/s against the same ~3.4 GB-per-
-token working set — the Lenovo reads at several GB/s. Both caches thrash
-(43% and 53% miss respectively), so neither is close to the resident limit
+The two runs above are apples-to-apples: the same prompt, the same flags
+(`--expert-gb 3.5 --max-seq 8192 --ngen 16 --direct`), both on cold caches.
+The Mac is exactly an order of magnitude slower on decode, and both causes are
+visible in the run: it decodes on 4 physical threads (the Lenovo uses 8), and
+it takes **1.5× longer to read the same bytes** — 3483 expert misses on both
+machines, 94.5 s of loading on the Mac vs 64.2 s on the Lenovo. Both caches
+thrash identically (~46% miss), so neither run is close to the resident limit
 this engine is built for; a fully resident run has not happened anywhere yet.
 
 Prefill runs **layer-major over chunks of `--chunk` tokens** (default 32), so
@@ -270,8 +273,10 @@ each unique expert is read once per layer per chunk and applied to every token
 that routed to it. Token-at-a-time is the fallback (`--chunk 1`): a token's six
 experts per layer are then read for that token alone. The ceiling is 256 reads
 per layer per chunk however long the chunk is, and the head is skipped for
-prompt tokens. Measured prefill: 6.1 s/token (Mac) and 4.0 s/token (Lenovo),
-both 10–12-token prompts on cold caches.
+prompt tokens. Measured prefill: 2.0 s/token (Mac) and 2.2 s/token (Lenovo),
+both 12-token prompts on cold caches — nearly equal, because prefill reads each
+unique expert once per layer and is dominated by the same ~3.4 GB working set on
+both machines.
 
 The batching is **bit-identical** to `--chunk 1`, on purpose: the sequential
 state still advances one token at a time inside each layer, the dense matmuls
